@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Logs
+logs/
+*.log
+
+# Database (contains live trade data — do not commit)
+*.db
+*.sqlite
+*.sqlite3
+
+# Auth tokens (SENSITIVE — never commit)
+auth/
+*.json
+!nifty_trader/data/events_cache.json
+
+# ML models (large binary files — use Git LFS if needed)
+models/
+
+# Pre-downloaded installer wheel packages (239MB — install via pip instead)
+nifty_trader/installer/packages/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

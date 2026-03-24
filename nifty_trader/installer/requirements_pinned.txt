@@ -1,0 +1,29 @@
+# NiftyTrader — Pinned dependencies for installer wheel download
+# These exact versions are tested to work together on Windows 64-bit + Python 3.10
+
+# ── Core UI ─────────────────────────────────────────────────────
+PySide6==6.7.2
+shiboken6==6.7.2
+
+# ── Data ────────────────────────────────────────────────────────
+pandas==2.2.2
+numpy==1.26.4
+
+# ── Database ────────────────────────────────────────────────────
+SQLAlchemy==2.0.30
+
+# ── Networking ──────────────────────────────────────────────────
+requests==2.32.3
+certifi==2024.6.2
+charset-normalizer==3.3.2
+idna==3.7
+urllib3==2.2.1
+
+# ── Python 3.10 standard library supplements ────────────────────
+python-dateutil==2.9.0
+pytz==2024.1
+tzdata==2024.1
+six==1.16.0
+
+# ── PySide6 transitive deps (auto-pulled but listing for safety) ─
+# PySide6-Essentials, PySide6-Addons handled by PySide6 meta-package

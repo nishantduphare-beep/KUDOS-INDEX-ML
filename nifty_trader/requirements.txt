@@ -1,0 +1,44 @@
+# NiftyTrader — Python Dependencies
+# Install: pip install -r requirements.txt
+
+# ── Core UI ───────────────────────────────────────────────────────
+PySide6>=6.5.0
+
+# ── Data & Math ───────────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.24.0
+
+# ── Database ──────────────────────────────────────────────────────
+SQLAlchemy>=2.0.0
+
+# ── Networking ────────────────────────────────────────────────────
+requests>=2.31.0
+
+# ── Desktop Notifications (optional) ─────────────────────────────
+plyer>=2.1.0
+
+# ─────────────────────────────────────────────────────────────────
+# BROKER SDKs  —  Install only the one you use
+# ─────────────────────────────────────────────────────────────────
+
+# Dhan
+# dhanhq>=1.3.0
+
+# Zerodha Kite
+# kiteconnect>=5.0.0
+
+# Upstox
+# upstox-python-sdk>=1.0.0
+
+# ─────────────────────────────────────────────────────────────────
+# ML / OPTIONAL  —  Install when you have enough data to train
+# ─────────────────────────────────────────────────────────────────
+# xgboost>=2.0.0
+# scikit-learn>=1.3.0
+# tensorflow>=2.13.0       # for LSTM
+# torch>=2.0.0             # alternative to TensorFlow
+
+# ─────────────────────────────────────────────────────────────────
+# TELEGRAM ALERTS  —  only if you want Telegram notifications
+# ─────────────────────────────────────────────────────────────────
+# python-telegram-bot>=20.0  # (optional, requests is sufficient)
