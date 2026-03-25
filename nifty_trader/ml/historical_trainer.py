@@ -53,17 +53,81 @@ _INDEX_SYMBOLS = {
     "SENSEX":     "BSE:SENSEX-INDEX",
 }
 _INDEX_ENCODED = {"NIFTY": 0, "BANKNIFTY": 1, "MIDCPNIFTY": 2, "SENSEX": 3}
-
-# Weekly expiry weekday per index (0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri)
-# NIFTY=Thu, BANKNIFTY=Wed, MIDCPNIFTY=Mon, SENSEX=Fri
-_EXPIRY_WEEKDAY = {
-    "NIFTY":      3,   # Thursday
-    "BANKNIFTY":  2,   # Wednesday
-    "MIDCPNIFTY": 0,   # Monday
-    "SENSEX":     4,   # Friday
-}
-
 _VIX_SYMBOL    = "NSE:INDIA VIX"   # same symbol Fyers uses for quotes
+
+# ─── Expiry schedule (SEBI circular Oct 1, 2024 — Circular 132/2024) ─────────
+#
+# Timeline:
+#   Before Nov 20 2024  : All indices had weekly options
+#                         NIFTY=Thu, BANKNIFTY=Thu, MIDCPNIFTY=Mon, SENSEX=Fri
+#   Nov 20 2024 – Aug 31 2025 :
+#                         NIFTY=Weekly Thu, BANKNIFTY=Monthly last-Thu,
+#                         MIDCPNIFTY=Monthly last-Mon, SENSEX=Weekly Fri
+#   Sep 1 2025 → current:
+#                         NIFTY=Weekly Tue, BANKNIFTY=Monthly last-Tue,
+#                         MIDCPNIFTY=Monthly last-Tue, SENSEX=Weekly Thu
+
+_SEBI_WEEKLY_CUTOFF = date(2024, 11, 20)   # BANKNIFTY/MIDCPNIFTY weekly ends
+_SEBI_DAY_CHANGE    = date(2025, 9,  1)    # NSE→Tue, BSE→Thu
+
+
+def _expiry_config(index_name: str, on_date: date) -> dict:
+    """
+    Return {"is_weekly": bool, "weekday": int(0=Mon..4=Fri)} for the
+    given index on the given date, reflecting all SEBI regime changes.
+    """
+    if on_date >= _SEBI_DAY_CHANGE:
+        # Current regime — Sep 1 2025 onwards
+        return {
+            "NIFTY":      {"is_weekly": True,  "weekday": 1},  # Weekly Tue
+            "BANKNIFTY":  {"is_weekly": False, "weekday": 1},  # Monthly last-Tue
+            "MIDCPNIFTY": {"is_weekly": False, "weekday": 1},  # Monthly last-Tue
+            "SENSEX":     {"is_weekly": True,  "weekday": 3},  # Weekly Thu
+        }.get(index_name, {"is_weekly": True, "weekday": 1})
+
+    if on_date >= _SEBI_WEEKLY_CUTOFF:
+        # Transitional — Nov 20 2024 to Aug 31 2025
+        return {
+            "NIFTY":      {"is_weekly": True,  "weekday": 3},  # Weekly Thu
+            "BANKNIFTY":  {"is_weekly": False, "weekday": 3},  # Monthly last-Thu
+            "MIDCPNIFTY": {"is_weekly": False, "weekday": 0},  # Monthly last-Mon
+            "SENSEX":     {"is_weekly": True,  "weekday": 4},  # Weekly Fri
+        }.get(index_name, {"is_weekly": True, "weekday": 3})
+
+    # Old regime — before Nov 20 2024 (all weekly)
+    return {
+        "NIFTY":      {"is_weekly": True, "weekday": 3},  # Weekly Thu
+        "BANKNIFTY":  {"is_weekly": True, "weekday": 3},  # Weekly Thu
+        "MIDCPNIFTY": {"is_weekly": True, "weekday": 0},  # Weekly Mon
+        "SENSEX":     {"is_weekly": True, "weekday": 4},  # Weekly Fri
+    }.get(index_name, {"is_weekly": True, "weekday": 3})
+
+
+def _last_weekday_in_month(year: int, month: int, weekday: int) -> date:
+    """Last occurrence of weekday (0=Mon..4=Fri) in the given month."""
+    import calendar as _cal
+    last_day = _cal.monthrange(year, month)[1]
+    d = date(year, month, last_day)
+    while d.weekday() != weekday:
+        d -= timedelta(days=1)
+    return d
+
+
+def _next_expiry_date(on_date: date, index_name: str) -> date:
+    """Next expiry date for index on or after on_date (rolls on expiry day after 15:30)."""
+    cfg = _expiry_config(index_name, on_date)
+    wd  = cfg["weekday"]
+    if cfg["is_weekly"]:
+        days = (wd - on_date.weekday()) % 7
+        return on_date + timedelta(days=days)
+    else:
+        # Monthly: last <wd> of current month; if past, go to next month
+        exp = _last_weekday_in_month(on_date.year, on_date.month, wd)
+        if exp < on_date:
+            nm = on_date.month + 1 if on_date.month < 12 else 1
+            ny = on_date.year if on_date.month < 12 else on_date.year + 1
+            exp = _last_weekday_in_month(ny, nm, wd)
+        return exp
 
 # Fyers returns max ~100 days per intraday request → fetch in chunks
 _MAX_DAYS_PER_REQUEST = 90
@@ -291,15 +355,30 @@ def compute_features(
         df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute - (9 * 60 + 15)
     ).clip(lower=0)
     df["day_of_week"]      = df["timestamp"].dt.dayofweek
-    expiry_wd = _EXPIRY_WEEKDAY.get(index_name, 3)   # weekday of weekly expiry
-    df["is_expiry"] = (df["timestamp"].dt.dayofweek == expiry_wd).astype(int)
+    # is_expiry and dte: date-aware — handles all SEBI regime changes
+    def _is_expiry_row(ts):
+        d   = ts.date()
+        cfg = _expiry_config(index_name, d)
+        wd  = cfg["weekday"]
+        if d.weekday() != wd:
+            return 0
+        if cfg["is_weekly"]:
+            return 1
+        # Monthly: only the last <wd> of the month is expiry
+        return 1 if d == _last_weekday_in_month(d.year, d.month, wd) else 0
 
-    def _dte(ts):
-        days = (expiry_wd - ts.weekday()) % 7
-        if days == 0 and ts.hour >= 15:   # already past expiry close today
-            days = 7
-        return days
-    df["dte"] = df["timestamp"].apply(_dte)
+    def _dte_row(ts):
+        d   = ts.date()
+        exp = _next_expiry_date(d, index_name)
+        dte = (exp - d).days
+        # If on expiry day and market is closed, roll to the next expiry
+        if dte == 0 and ts.hour >= 15:
+            exp2 = _next_expiry_date(d + timedelta(days=1), index_name)
+            dte  = (exp2 - d).days
+        return dte
+
+    df["is_expiry"] = df["timestamp"].apply(_is_expiry_row)
+    df["dte"]       = df["timestamp"].apply(_dte_row)
 
     def _session(m):
         if m < 30:  return 1   # opening
