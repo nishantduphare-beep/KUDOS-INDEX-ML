@@ -53,6 +53,16 @@ _INDEX_SYMBOLS = {
     "SENSEX":     "BSE:SENSEX-INDEX",
 }
 _INDEX_ENCODED = {"NIFTY": 0, "BANKNIFTY": 1, "MIDCPNIFTY": 2, "SENSEX": 3}
+
+# Weekly expiry weekday per index (0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri)
+# NIFTY=Thu, BANKNIFTY=Wed, MIDCPNIFTY=Mon, SENSEX=Fri
+_EXPIRY_WEEKDAY = {
+    "NIFTY":      3,   # Thursday
+    "BANKNIFTY":  2,   # Wednesday
+    "MIDCPNIFTY": 0,   # Monday
+    "SENSEX":     4,   # Friday
+}
+
 _VIX_SYMBOL    = "NSE:INDIA VIX"   # same symbol Fyers uses for quotes
 
 # Fyers returns max ~100 days per intraday request → fetch in chunks
@@ -281,13 +291,14 @@ def compute_features(
         df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute - (9 * 60 + 15)
     ).clip(lower=0)
     df["day_of_week"]      = df["timestamp"].dt.dayofweek
-    df["is_expiry"]        = (df["timestamp"].dt.dayofweek == 3).astype(int)  # Thursday
+    expiry_wd = _EXPIRY_WEEKDAY.get(index_name, 3)   # weekday of weekly expiry
+    df["is_expiry"] = (df["timestamp"].dt.dayofweek == expiry_wd).astype(int)
 
     def _dte(ts):
-        days_to_thu = (3 - ts.weekday()) % 7
-        if days_to_thu == 0 and ts.hour >= 15:
-            days_to_thu = 7
-        return days_to_thu
+        days = (expiry_wd - ts.weekday()) % 7
+        if days == 0 and ts.hour >= 15:   # already past expiry close today
+            days = 7
+        return days
     df["dte"] = df["timestamp"].apply(_dte)
 
     def _session(m):
