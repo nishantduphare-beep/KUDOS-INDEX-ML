@@ -108,7 +108,16 @@ class DhanAdapter(CombinedBrokerAdapter):
             data   = self._dhan.option_chain(
                 UnderlyingScrip=sec_id, UnderlyingSeg="IDX_I", Expirycode=1
             )
-            oc_raw = data.get("data", {}).get("oc", [])
+            oc_data = data.get("data", {})
+            oc_raw  = oc_data.get("oc", [])
+
+            # Update lot size from broker response if Dhan provides it.
+            broker_lot = oc_data.get("lot_size") or oc_data.get("lotSize")
+            if broker_lot and int(broker_lot) > 0:
+                current = config.SYMBOL_MAP.get(index_name, {}).get("lot_size", 0)
+                if current != int(broker_lot):
+                    config.SYMBOL_MAP.setdefault(index_name, {})["lot_size"] = int(broker_lot)
+                    logger.info(f"Lot size updated from broker [{index_name}]: {current} → {broker_lot}")
             strikes = []
             for item in oc_raw:
                 s = float(item.get("strike_price", 0))

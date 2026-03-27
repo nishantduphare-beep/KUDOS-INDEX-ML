@@ -53,7 +53,8 @@ _INDEX_SYMBOLS = {
     "SENSEX":     "BSE:SENSEX-INDEX",
 }
 _INDEX_ENCODED = {"NIFTY": 0, "BANKNIFTY": 1, "MIDCPNIFTY": 2, "SENSEX": 3}
-_VIX_SYMBOL    = "NSE:INDIA VIX"   # same symbol Fyers uses for quotes
+# Fyers uses different symbols for quotes vs history — try both
+_VIX_SYMBOLS = ["NSE:INDIA VIX", "NSE:INDIAVIX-INDEX", "NSE:INDIA_VIX-INDEX"]
 
 # ─── Expiry schedule (SEBI circular Oct 1, 2024 — Circular 132/2024) ─────────
 #
@@ -187,11 +188,12 @@ def _fetch_history(fyers_obj, symbol: str, resolution: str,
     df.drop(columns=["ts"], inplace=True)
     df = df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
-    # Market hours only: 09:15–15:30
-    t = df["timestamp"].dt.time
-    mkt_open  = datetime.strptime("09:15", "%H:%M").time()
-    mkt_close = datetime.strptime("15:30", "%H:%M").time()
-    df = df[(t >= mkt_open) & (t <= mkt_close)].reset_index(drop=True)
+    # Market hours filter: 09:15–15:30 (skip for daily resolution — whole-day candles)
+    if resolution != "D":
+        t = df["timestamp"].dt.time
+        mkt_open  = datetime.strptime("09:15", "%H:%M").time()
+        mkt_close = datetime.strptime("15:30", "%H:%M").time()
+        df = df[(t >= mkt_open) & (t <= mkt_close)].reset_index(drop=True)
     return df
 
 
@@ -388,14 +390,13 @@ def compute_features(
     df["session"] = df["mins_since_open"].apply(_session)
 
     # ── Group B: Price context ────────────────────────────────────────────────
-    # prev day close = first candle of each day's open
-    df["_date"]            = df["timestamp"].dt.date
-    daily_first_close      = df.groupby("_date")["close"].first()
-    df["_prev_day_close"]  = df["_date"].map(lambda d: daily_first_close.get(d, np.nan)).shift(
-        df.groupby("_date")["close"].transform("count")
-    )
-    # Simpler: use yesterday's last close
-    df["_prev_close"]      = df.groupby("_date")["close"].transform("first").shift(1)
+    df["_date"] = df["timestamp"].dt.date
+    # Build prev-day close map: each trading date → last close of previous trading date
+    daily_last  = df.groupby("_date")["close"].last()
+    date_list   = sorted(daily_last.index)
+    prev_close_map = {date_list[i]: daily_last[date_list[i - 1]]
+                      for i in range(1, len(date_list))}
+    df["_prev_close"]      = df["_date"].map(prev_close_map)
     df["spot_vs_prev_pct"] = (df["close"] - df["_prev_close"]) / df["_prev_close"].replace(0, np.nan) * 100
     df["atr_pct_spot"]     = df["atr"] / df["close"] * 100
     df["chop"]             = _choppiness(df, 14)
@@ -510,7 +511,7 @@ def compute_features(
     df["candle_completion_pct"] = 1.0   # historical candles are always complete
 
     # Cleanup temp columns
-    for c in ["_date", "_prev_close", "_prev_day_close", "date_str",
+    for c in ["_date", "_prev_close", "date_str",
               "cum_tpv", "cum_vol", "tp_vol", "struct_3m"]:
         df.drop(columns=[c], errors="ignore", inplace=True)
 
@@ -733,21 +734,24 @@ def run(indices: List[str], days: int, min_engines: int = 2):
     date_to    = date.today()
     date_from  = date_to - timedelta(days=days)
 
-    # Fetch India VIX history once (daily candles — enough for intraday merge)
+    # Fetch India VIX history once — try multiple symbols (Fyers uses different
+    # symbol names for quotes vs historical data API)
     logger.info("Fetching India VIX history...")
-    try:
-        vix_df = _fetch_history(fyers_obj, _VIX_SYMBOL, "D", date_from, date_to)
-        if not vix_df.empty:
-            # Broadcast each daily VIX value to cover the full trading day
-            # so merge_asof can match intraday 3-min timestamps
-            vix_df["timestamp"] = pd.to_datetime(vix_df["timestamp"].dt.date) + timedelta(hours=9, minutes=15)
-            logger.info(f"VIX history: {len(vix_df)} days loaded")
-        else:
-            logger.warning("VIX history empty — using default VIX=15")
-            vix_df = None
-    except Exception as e:
-        logger.warning(f"VIX fetch failed: {e} — using default VIX=15")
-        vix_df = None
+    vix_df = None
+    for vix_sym in _VIX_SYMBOLS:
+        try:
+            df_try = _fetch_history(fyers_obj, vix_sym, "D", date_from, date_to)
+            if not df_try.empty:
+                # Broadcast each daily VIX to 9:15 AM so merge_asof works with 3-min timestamps
+                df_try["timestamp"] = pd.to_datetime(df_try["timestamp"].dt.date) + timedelta(hours=9, minutes=15)
+                vix_df = df_try
+                logger.info(f"VIX history: {len(vix_df)} days loaded (symbol: {vix_sym})")
+                break
+            logger.debug(f"VIX symbol {vix_sym} returned 0 bars — trying next")
+        except Exception as e:
+            logger.debug(f"VIX symbol {vix_sym} failed: {e}")
+    if vix_df is None:
+        logger.warning("VIX history unavailable from all symbols — using default VIX=15")
 
     total_saved   = 0
     total_labeled = 0

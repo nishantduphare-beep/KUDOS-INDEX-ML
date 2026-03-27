@@ -6,7 +6,7 @@ Handles all alert delivery: popup, sound, Telegram.
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional, Callable, List
 import os
 
@@ -32,6 +32,15 @@ class AlertManager:
         # Track dispatched alert_ids — UI callback fires every tick (live updates),
         # but sound/popup/Telegram fire only ONCE per unique alert.
         self._dispatched_ids: set = set()
+        self._dispatched_date: date = date.today()   # reset daily
+
+        # ToastNotifier singleton — creating it per-call is slow and not thread-safe
+        self._toaster = None
+        try:
+            from win10toast import ToastNotifier  # type: ignore
+            self._toaster = ToastNotifier()
+        except Exception:
+            pass
 
         if config.TELEGRAM_ENABLED:
             try:
@@ -99,6 +108,12 @@ class AlertManager:
             except Exception as e:
                 logger.error(f"UI callback error: {e}")
 
+        # Prune _dispatched_ids at midnight so multi-day runs don't accumulate IDs
+        today = date.today()
+        if today != self._dispatched_date:
+            self._dispatched_ids.clear()
+            self._dispatched_date = today
+
         # Sound / popup / Telegram — fire ONCE per unique alert_id only
         alert_id = getattr(alert_obj, "alert_id", None)
         is_new = alert_id is None or alert_id not in self._dispatched_ids
@@ -108,8 +123,8 @@ class AlertManager:
         if not is_new:
             return   # UI already updated above; skip repeat notifications
 
-        # Sound alert
-        if self._sound_enabled:
+        # Sound alert — Option A: only fire for S11 alerts (is_s11 flag set by S11Monitor)
+        if self._sound_enabled and getattr(alert_obj, "is_s11", False):
             threading.Thread(
                 target=self._play_sound,
                 args=(sound_count, is_trade),
@@ -153,8 +168,7 @@ class AlertManager:
             except Exception:
                 pass
 
-    @staticmethod
-    def _show_popup(title: str, message: str):
+    def _show_popup(self, title: str, message: str):
         """Cross-platform desktop notification."""
         try:
             from plyer import notification  # type: ignore
@@ -165,10 +179,11 @@ class AlertManager:
                 timeout=10,
             )
         except ImportError:
-            try:
-                # Fallback: Windows toast via win10toast
-                from win10toast import ToastNotifier  # type: ignore
-                toaster = ToastNotifier()
-                toaster.show_toast(title, message, duration=8, threaded=True)
-            except ImportError:
-                logger.debug("No popup library available (install plyer)")
+            # Fallback: Windows toast via pre-created singleton (thread-safe, fast)
+            if self._toaster is not None:
+                try:
+                    self._toaster.show_toast(title, message, duration=8, threaded=True)
+                except Exception as e:
+                    logger.debug(f"Toast popup error: {e}")
+            else:
+                logger.debug("No popup library available (install plyer or win10toast)")

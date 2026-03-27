@@ -26,6 +26,7 @@ Flow:
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────
 # Live caches — populated by DataManager via update_from_broker()
 # ──────────────────────────────────────────────────────────────────
+_cache_lock = threading.Lock()   # guards both caches for thread-safe reads/writes
 _option_expiry_cache:  Dict[str, List[date]] = {}   # all expiries (weekly + monthly)
 _futures_expiry_cache: Dict[str, List[date]] = {}   # monthly-end expiries only
 
@@ -61,20 +63,22 @@ def update_from_broker(index_name: str, expiry_dates: List[str]) -> None:
         return
 
     parsed.sort()
-    _option_expiry_cache[index_name] = parsed
 
-    # Derive futures expiry: last date of each calendar (year, month) group
     monthly_map: Dict[tuple, date] = {}
     for d in parsed:
         key = (d.year, d.month)
         if key not in monthly_map or d > monthly_map[key]:
             monthly_map[key] = d
-    _futures_expiry_cache[index_name] = sorted(monthly_map.values())
+    futures_list = sorted(monthly_map.values())
+
+    with _cache_lock:
+        _option_expiry_cache[index_name]  = parsed
+        _futures_expiry_cache[index_name] = futures_list
 
     logger.debug(
         f"Expiry cache [{index_name}]: "
         f"options={[str(d) for d in parsed[:4]]} "
-        f"futures={[str(d) for d in _futures_expiry_cache[index_name][:3]]}"
+        f"futures={[str(d) for d in futures_list[:3]]}"
     )
 
 
@@ -86,13 +90,13 @@ def update_from_chain_expiry(index_name: str, expiry_str: str) -> None:
     d = _parse_expiry_str(expiry_str)
     if not d:
         return
-    existing = _option_expiry_cache.get(index_name, [])
-    if d not in existing:
-        merged = sorted(set(existing + [d]))
-        _option_expiry_cache[index_name] = merged
-        # Also update futures cache if this date is month-end relative to what we have
-        _rebuild_futures_cache(index_name)
-        logger.debug(f"Expiry chain-update [{index_name}]: {d}")
+    with _cache_lock:
+        existing = _option_expiry_cache.get(index_name, [])
+        if d not in existing:
+            _option_expiry_cache[index_name] = sorted(set(existing + [d]))
+            # Rebuild futures cache inside the same lock
+            _rebuild_futures_cache_locked(index_name)
+            logger.debug(f"Expiry chain-update [{index_name}]: {d}")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -102,7 +106,9 @@ def update_from_chain_expiry(index_name: str, expiry_str: str) -> None:
 def get_current_option_expiry(index_name: str, ref_date: date = None) -> date:
     """Nearest weekly option expiry >= ref_date."""
     today = ref_date or date.today()
-    for d in _option_expiry_cache.get(index_name, []):
+    with _cache_lock:
+        cache = list(_option_expiry_cache.get(index_name, []))
+    for d in cache:
         if d >= today:
             return d
     return _hardcoded_option_expiry(index_name, today)
@@ -120,7 +126,9 @@ def days_to_option_expiry(index_name: str, ref_date: date = None) -> int:
 
 def all_option_expiries(index_name: str) -> List[date]:
     today = date.today()
-    return [d for d in _option_expiry_cache.get(index_name, []) if d >= today]
+    with _cache_lock:
+        cache = list(_option_expiry_cache.get(index_name, []))
+    return [d for d in cache if d >= today]
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -130,7 +138,9 @@ def all_option_expiries(index_name: str) -> List[date]:
 def get_current_futures_expiry(index_name: str, ref_date: date = None) -> date:
     """Nearest monthly futures expiry >= ref_date."""
     today = ref_date or date.today()
-    for d in _futures_expiry_cache.get(index_name, []):
+    with _cache_lock:
+        cache = list(_futures_expiry_cache.get(index_name, []))
+    for d in cache:
         if d >= today:
             return d
     return _hardcoded_futures_expiry(index_name, today)
@@ -148,7 +158,9 @@ def days_to_futures_expiry(index_name: str, ref_date: date = None) -> int:
 
 def all_futures_expiries(index_name: str) -> List[date]:
     today = date.today()
-    return [d for d in _futures_expiry_cache.get(index_name, []) if d >= today]
+    with _cache_lock:
+        cache = list(_futures_expiry_cache.get(index_name, []))
+    return [d for d in cache if d >= today]
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -183,7 +195,7 @@ def expiry_summary() -> Dict[str, dict]:
             "futures_dte":        fut_dte,
             "is_futures_expiry":  fut_dte == 0,
             "pre_futures_expiry": fut_dte <= config.PRE_EXPIRY_COLLECTION_DAYS,
-            "source": "broker" if _option_expiry_cache.get(idx) else "fallback",
+            "source": "broker" if get_current_option_expiry(idx, today) != _hardcoded_option_expiry(idx, today) else "fallback",
         }
     return result
 
@@ -240,8 +252,8 @@ def _parse_expiry_str(raw: str) -> Optional[date]:
     return None
 
 
-def _rebuild_futures_cache(index_name: str) -> None:
-    """Rebuild futures cache from option cache (last expiry per month)."""
+def _rebuild_futures_cache_locked(index_name: str) -> None:
+    """Rebuild futures cache from option cache. Caller MUST hold _cache_lock."""
     monthly_map: Dict[tuple, date] = {}
     for d in _option_expiry_cache.get(index_name, []):
         key = (d.year, d.month)

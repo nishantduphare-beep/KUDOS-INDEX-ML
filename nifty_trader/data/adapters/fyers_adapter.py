@@ -499,7 +499,16 @@ class FyersAdapter(CombinedBrokerAdapter):
 
     # ─── Previous Day Close ───────────────────────────────────────
     def get_prev_day_close(self, index_name: str) -> float:
-        """Fetch 2 daily candles; return previous day's close."""
+        """
+        Fetch recent daily candles and return yesterday's close.
+
+        Fyers does NOT include today's partial candle during market hours,
+        so candles[-1] is always the last completed trading day (yesterday).
+        We verify by checking the timestamp of the last candle:
+          - If its date == today  → today's candle IS present → use candles[-2]
+          - If its date <  today  → candles[-1] IS yesterday  → use candles[-1]
+        This prevents the off-by-one bug where day-before-yesterday was returned.
+        """
         if not self._fyers:
             return 0.0
         from_dt = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
@@ -513,10 +522,22 @@ class FyersAdapter(CombinedBrokerAdapter):
                 "cont_flag":   "1",
             })
             candles = resp.get("candles", [])
-            if len(candles) >= 2:
-                return float(candles[-2][4])   # index 4 = close of previous day
-            if len(candles) == 1:
+            if not candles:
+                return 0.0
+
+            # Determine whether today's candle is included
+            last_ts   = candles[-1][0]          # Unix timestamp
+            last_date = datetime.fromtimestamp(last_ts).date()
+            today     = datetime.now().date()
+
+            if last_date >= today:
+                # Today's candle present → candles[-1] is today, candles[-2] is yesterday
+                if len(candles) >= 2:
+                    return float(candles[-2][4])
+            else:
+                # Today's candle not yet formed → candles[-1] IS yesterday
                 return float(candles[-1][4])
+
         except Exception as e:
             logger.error(f"Fyers prev_day_close [{index_name}]: {e}")
         return 0.0
@@ -565,6 +586,16 @@ class FyersAdapter(CombinedBrokerAdapter):
             expiry_list = data.get("expiryData", [])
             expiry_str  = expiry_list[0].get("date", "") if expiry_list else ""
             raw_chain   = data.get("optionsChain", [])
+
+            # Update lot size from broker response — Fyers returns lotSize in data dict.
+            # This keeps config.SYMBOL_MAP current without any extra API call.
+            broker_lot = (data.get("lotSize") or data.get("lot_size") or
+                          (expiry_list[0].get("lotSize") if expiry_list else None))
+            if broker_lot and int(broker_lot) > 0:
+                current = config.SYMBOL_MAP.get(index_name, {}).get("lot_size", 0)
+                if current != int(broker_lot):
+                    config.SYMBOL_MAP.setdefault(index_name, {})["lot_size"] = int(broker_lot)
+                    logger.info(f"Lot size updated from broker [{index_name}]: {current} → {broker_lot}")
 
             # Time-to-expiry — use Unix timestamp from broker (no parsing needed)
             expiry_unix = int(expiry_list[0].get("expiry", 0)) if expiry_list else 0

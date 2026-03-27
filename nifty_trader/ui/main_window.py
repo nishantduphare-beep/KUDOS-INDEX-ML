@@ -25,6 +25,8 @@ from ui.hq_trades_tab    import HQTradesTab
 from ui.credentials_tab  import CredentialsTab
 from ui.ml_report_widget import MLReportWidget
 from ui.ledger_tab       import LedgerTab
+from ui.setup_tab        import SetupTab
+from ui.s11_tab          import S11Tab
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +144,15 @@ class MainWindow(QMainWindow):
         # read live SL/T1/T2/T3 hits to compute simulated P&L
         self._order_manager.set_outcome_tracker(self._outcome_tracker)
 
+        # S11 paper-trade monitor — created before _connect_signals so
+        # on_alert is registered as a UI callback before sound fires.
+        from engines.s11_monitor import S11Monitor
+        from database.manager import get_db as _get_db
+        self._s11_monitor = S11Monitor(db=_get_db())
+        # Register on_alert as a UI callback — it runs synchronously before
+        # the sound thread starts, setting alert_obj.is_s11 = True (Option A).
+        self._am.add_ui_callback(self._s11_monitor.on_alert)
+
         self._setup_window()
         self._setup_tabs()
         self._setup_statusbar()
@@ -156,6 +167,9 @@ class MainWindow(QMainWindow):
         from database.manager import get_db
         self._ledger_tab.set_db(get_db())
         self._ledger_tab.set_order_manager(self._order_manager)
+
+        # Wire S11 tab with its monitor
+        self._s11_tab.set_monitor(self._s11_monitor)
 
     def _setup_window(self):
         self.setWindowTitle("NiftyTrader Intelligence  v2.0")
@@ -173,7 +187,9 @@ class MainWindow(QMainWindow):
         self._oc_tab        = OptionsFlowTab(self._dm)
         self._alerts_tab    = AlertsTab()
         self._hq_tab        = HQTradesTab()
+        self._setup_tab     = SetupTab()
         self._ledger_tab    = LedgerTab()
+        self._s11_tab       = S11Tab()
 
         self._tabs.addTab(self._cred_tab,      "🔑  CREDENTIALS")
         self._tabs.addTab(self._dashboard_tab, "📊  DASHBOARD")
@@ -181,7 +197,9 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._oc_tab,        "📈  OPTIONS FLOW")
         self._tabs.addTab(self._alerts_tab,    "🚨  ALERTS")
         self._tabs.addTab(self._hq_tab,        "⭐  HQ TRADES")
+        self._tabs.addTab(self._setup_tab,     "🎯  SETUPS")
         self._tabs.addTab(self._ledger_tab,    "📒  LEDGER")
+        self._tabs.addTab(self._s11_tab,       "⚡  S11")
 
         # Developer-only tab — hidden in client builds
         self._ml_report_tab = None
@@ -419,6 +437,13 @@ class MainWindow(QMainWindow):
                     except Exception as e:
                         logger.error(f"Option price history save error: {e}")
 
+            # ── Tick S11 paper-trade monitor ───────────────────────
+            if spot_prices:
+                try:
+                    self._s11_monitor.tick(spot_prices, option_ltps)
+                except Exception as e:
+                    logger.error(f"S11Monitor tick error: {e}")
+
         try:
             threading.Thread(target=_eval, daemon=True).start()
         except Exception as e:
@@ -458,6 +483,39 @@ class MainWindow(QMainWindow):
                     "raw_features":      getattr(alert_obj, "raw_features", {}),
                 })
                 alert_obj.alert_id = cid
+
+                # Save setup_alerts for CONFIRMED_SIGNAL so per-setup stats
+                # capture the highest-quality outcome (candle-close confirmed).
+                try:
+                    from engines.setup_screener import SetupScreener
+                    _screener = self._sa._setup_screener
+                    _chain = self._dm.get_option_chain(alert_obj.index_name)
+                    _df    = self._dm.get_df(alert_obj.index_name)
+                    _df5   = self._dm.get_df_5m(alert_obj.index_name)
+                    _df15  = self._dm.get_df_15m(alert_obj.index_name)
+                    # Re-evaluate using cached engine results from the last tick
+                    _cached = self._sa.get_last_engine_results(alert_obj.index_name)
+                    if _cached and cid:
+                        _conf_hits = _screener.evaluate(
+                            index_name=alert_obj.index_name,
+                            direction=alert_obj.direction,
+                            timestamp=alert_obj.timestamp,
+                            spot_price=alert_obj.spot_price,
+                            atr=alert_obj.atr,
+                            engines_count=len(getattr(alert_obj, "engines_triggered", [])),
+                            di_r=_cached["di_r"],
+                            vol_r=_cached["vol_r"],
+                            oc_r=_cached["oc_r"],
+                            regime_r=_cached["regime_r"],
+                            vwap_r=_cached["vwap_r"],
+                            mtf_r=_cached["mtf_r"],
+                            pcr=alert_obj.pcr,
+                        )
+                        if _conf_hits:
+                            _db.save_setup_alerts(_conf_hits, alert_id=cid)
+                except Exception as _se:
+                    logger.debug(f"SetupScreener (confirmed) save failed: {_se}")
+
                 # Register confirmed signal with outcome tracker so its row
                 # gets WIN/LOSS/SL outcome instead of staying OPEN forever.
                 try:
@@ -535,6 +593,17 @@ class MainWindow(QMainWindow):
             config.ALERT_FLASH_DURATION_MS,
             lambda: self._tabs.tabBar().setTabTextColor(4, QColor("#8b949e"))
         )
+
+        # Flash S11 tab and refresh when an S11 alert fires
+        if getattr(alert_obj, "is_s11", False):
+            _s11_idx = self._tabs.indexOf(self._s11_tab)
+            if _s11_idx >= 0:
+                self._tabs.tabBar().setTabTextColor(_s11_idx, QColor("#e3b341"))
+                QTimer.singleShot(
+                    config.ALERT_FLASH_DURATION_MS,
+                    lambda: self._tabs.tabBar().setTabTextColor(_s11_idx, QColor("#8b949e"))
+                )
+            self._s11_tab.refresh()
 
     def _save_option_price_history(self, option_ltps: dict, now):
         """

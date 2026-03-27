@@ -27,6 +27,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta, time as _time
 from typing import Dict, List, Optional, Any
+import numpy as np
 import pandas as pd
 
 import config
@@ -41,6 +42,7 @@ from engines.iv_expansion import IVExpansionDetector, IVExpansionResult
 from engines.market_regime import MarketRegimeDetector, MarketRegimeResult
 from engines.mtf_alignment import MTFAlignmentEngine, MTFResult
 from engines.vwap_pressure import VWAPPressureDetector, VWAPResult
+from engines.setup_screener import SetupScreener
 from database.manager import get_db
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,9 @@ class EarlyMoveAlert:
     raw_features: Dict[str, Any]
     engine_results: Dict[str, Any] = field(default_factory=dict)
     alert_type: str = "EARLY_MOVE"
+    # S11 flag — set True by S11Monitor callback if this alert passes S11 condition.
+    # alert_manager._dispatch() gates sound on this flag (Option A).
+    is_s11: bool = False
     # MTF alignment info
     mtf_alignment:  str   = "NEUTRAL"  # STRONG/PARTIAL/NEUTRAL/WEAK/OPPOSING
     mtf_bias_5m:    str   = "NEUTRAL"
@@ -118,6 +123,9 @@ class TradeSignal:
     alert_id: int = 0
     # Set True for the single candle-close confirmed copy of this signal
     is_confirmed: bool = False
+    # S11 flag — set True by S11Monitor callback if this alert passes S11 condition.
+    # alert_manager._dispatch() gates sound on this flag (Option A).
+    is_s11: bool = False
 
     @property
     def action(self) -> str:
@@ -172,6 +180,7 @@ class SignalAggregator:
         self._regime_engine       = MarketRegimeDetector()
         self._vwap_engine         = VWAPPressureDetector()
         self._mtf_engine          = MTFAlignmentEngine()
+        self._setup_screener      = SetupScreener()
         self._db = get_db()
         self._lock = threading.Lock()
 
@@ -205,6 +214,9 @@ class SignalAggregator:
 
         # India VIX — updated by main_window from DataManager each tick.
         self._vix: float = 0.0
+
+        # Diagnostic log dedup — tracks which index+candle combos have been logged.
+        self._diag_logged: set = set()
 
     def evaluate(
         self,
@@ -393,8 +405,14 @@ class SignalAggregator:
         self._last_engine_results[index_name] = {
             "results": [
                 compression_r, di_r, oc_r, vol_r,
-                liq_r, gamma_r, iv_r, regime_r,
+                liq_r, gamma_r, iv_r, vwap_r, regime_r,
             ],
+            # Named refs so callers (e.g. confirmed-signal screener) can access by name
+            "di_r":      di_r,
+            "oc_r":      oc_r,
+            "vol_r":     vol_r,
+            "regime_r":  regime_r,
+            "vwap_r":    vwap_r,
             "mtf_r":     mtf_r,
             "triggered": engines_triggered,
             "conf":      confidence,
@@ -412,6 +430,7 @@ class SignalAggregator:
             "liquidity_trap":  liq_r.features,
             "gamma_levels":    gamma_r.features,
             "iv_expansion":    iv_r.features,
+            "vwap_pressure":   vwap_r.features,
             "market_regime":   regime_r.features,
             "mtf_alignment":   mtf_r.features,
             "spot_price": spot_price,
@@ -524,6 +543,35 @@ class SignalAggregator:
                 except Exception as _mle:
                     logger.warning(f"ML feature save failed (alert still fired): {_mle}")
 
+                # ── SetupScreener — evaluate all 23 named setups ──────
+                # Runs on every new candle alert (throttled same as ML features).
+                # Saves one row per triggered setup to setup_alerts table.
+                try:
+                    _setup_hits = self._setup_screener.evaluate(
+                        index_name=index_name,
+                        direction=consensus_direction,
+                        timestamp=now,
+                        spot_price=spot_price,
+                        atr=atr,
+                        engines_count=engines_triggered,
+                        di_r=di_r,
+                        vol_r=vol_r,
+                        oc_r=oc_r,
+                        regime_r=regime_r,
+                        vwap_r=vwap_r,
+                        mtf_r=mtf_r,
+                        pcr=pcr,
+                    )
+                    if _setup_hits:
+                        self._db.save_setup_alerts(_setup_hits, alert_id=alert_id)
+                        logger.debug(
+                            f"SetupScreener [{index_name}]: "
+                            f"{len(_setup_hits)} setups saved "
+                            f"(alert_id={alert_id})"
+                        )
+                except Exception as _se:
+                    logger.warning(f"SetupScreener save failed (non-fatal): {_se}")
+
                 self._last_early_alert_time[_alert_key] = now
                 self._last_alert_time[index_name] = now
                 logger.info(f"EARLY MOVE ALERT: {index_name} {consensus_direction} "
@@ -543,6 +591,24 @@ class SignalAggregator:
 
             # CRITICAL-1: block Trade Signal in RANGING market.
             _is_ranging = getattr(regime_r, "ranging", False)
+
+            # Trending Regime gate — require TRENDING regime for Trade Signals.
+            # Tested: TRENDING = 55.8% WR vs 12.8% base (4.37x lift, 6-day live data).
+            # AMBIGUOUS / VOLATILE / RANGING are all blocked when this is enabled.
+            _regime_label  = getattr(regime_r, "regime", "")
+            _trending_ok   = (
+                not config.REQUIRE_TRENDING_REGIME
+                or _regime_label == "TRENDING"
+            )
+
+            # Index direction filter — block low-win-rate directions per index.
+            # BANKNIFTY bull WR=21-32% vs bear WR=71% (6-day live data).
+            _dir_filter    = getattr(config, "INDEX_DIRECTION_FILTER", {})
+            _allowed_dir   = _dir_filter.get(index_name, "")
+            _direction_ok  = (
+                not _allowed_dir
+                or consensus_direction == _allowed_dir
+            )
 
             # Index filter — block known low-win-rate indices entirely,
             # require higher confidence for strict indices (data-driven).
@@ -573,8 +639,8 @@ class SignalAggregator:
 
             # Momentum expansion: candle range > ATR × multiplier
             _last_row = df.iloc[-1] if df is not None and len(df) > 0 else None
-            _atr_val  = float(_last_row.get("atr", 0)) if _last_row is not None else 0
-            _c_range  = float(_last_row["high"] - _last_row["low"]) if _last_row is not None else 0
+            _atr_val  = float(_last_row.get("atr", 0))  if _last_row is not None else 0
+            _c_range  = float(_last_row.get("high", 0) - _last_row.get("low", 0)) if _last_row is not None else 0
             _range_ok = _c_range > _atr_val * config.BREAKOUT_ATR_MULTIPLIER
 
             # Volume confirmation — relaxed for cash indices (volume often 0 from broker).
@@ -679,11 +745,14 @@ class SignalAggregator:
                 or mtf_r.alignment == "STRONG"
             )
 
-            # Diagnostic: log why trade signal didn't fire (once per candle per index)
+            # Diagnostic: log why trade signal didn't fire (once per candle per index).
+            # Prune _diag_logged to only the current minute's keys so the set stays bounded
+            # regardless of session length (max entries = 4 indices × 1 per minute = tiny).
+            _cur_minute = now.strftime("%H%M")
+            self._diag_logged = {k for k in self._diag_logged if k.endswith(_cur_minute)}
+
             if engines_triggered >= config.MIN_ENGINES_FOR_SIGNAL:
-                _diag_key = f"{index_name}:diag:{now.strftime('%H%M')}"
-                if not getattr(self, "_diag_logged", None):
-                    self._diag_logged = set()
+                _diag_key = f"{index_name}:diag:{_cur_minute}"
                 if _diag_key not in self._diag_logged:
                     self._diag_logged.add(_diag_key)
                     _ml_prob = f"{_ml_pred.probability:.2f}" if (_ml_pred and _ml_pred.is_available) else "n/a"
@@ -700,11 +769,15 @@ class SignalAggregator:
                         f"index_blocked={_index_blocked} strict_ok={_strict_conf_ok} "
                         f"ml_prob={_ml_prob}(ok={_ml_gate_ok}) "
                         f"event_ok={_event_ok} vix={self._vix:.1f}(ok={_vix_ok}) "
+                        f"regime={_regime_label}(trending_ok={_trending_ok}) "
+                        f"dir_filter={_allowed_dir or 'any'}(ok={_direction_ok}) "
                         f"engines={engines_triggered}"
                     )
 
             if ((_path_a or _path_b)
                     and not _is_ranging
+                    and _trending_ok
+                    and _direction_ok
                     and _candle_ok
                     and _mtf_strong_ok
                     and _adx_ok
@@ -742,30 +815,30 @@ class SignalAggregator:
                 # Persist trade signal (non-fatal — signal fires regardless)
                 _ml = signal.ml_prediction
                 try:
-                 trade_alert_id = self._db.save_alert({
-                    "index_name": index_name,
-                    "timestamp": now,
-                    "alert_type": "TRADE_SIGNAL",
-                    "direction": consensus_direction,
-                    "confidence_score": confidence,
-                    "engines_triggered": triggered_engines,
-                    "engines_count": engines_triggered,
-                    "spot_price": spot_price,
-                    "pcr": pcr,
-                    "atr": atr,
-                    "atm_strike": signal.atm_strike,
-                    "suggested_instrument": signal.suggested_instrument,
-                    "entry_reference": signal.entry_reference,
-                    "stop_loss_reference": signal.stop_loss_reference,
-                    "target_reference": getattr(signal, "target1", signal.target_reference),
-                    "target1": getattr(signal, "target1", None),
-                    "target2": getattr(signal, "target2", None),
-                    "target3": getattr(signal, "target3", None),
-                    "ml_score": _ml.ml_confidence if _ml else None,
-                    "ml_phase": _ml.phase if _ml else 1,
-                    "raw_features": raw_features,
-                 })
-                 signal.alert_id = trade_alert_id
+                    trade_alert_id = self._db.save_alert({
+                        "index_name": index_name,
+                        "timestamp": now,
+                        "alert_type": "TRADE_SIGNAL",
+                        "direction": consensus_direction,
+                        "confidence_score": confidence,
+                        "engines_triggered": triggered_engines,
+                        "engines_count": engines_triggered,
+                        "spot_price": spot_price,
+                        "pcr": pcr,
+                        "atr": atr,
+                        "atm_strike": signal.atm_strike,
+                        "suggested_instrument": signal.suggested_instrument,
+                        "entry_reference": signal.entry_reference,
+                        "stop_loss_reference": signal.stop_loss_reference,
+                        "target_reference": getattr(signal, "target1", signal.target_reference),
+                        "target1": getattr(signal, "target1", None),
+                        "target2": getattr(signal, "target2", None),
+                        "target3": getattr(signal, "target3", None),
+                        "ml_score": _ml.ml_confidence if _ml else None,
+                        "ml_phase": _ml.phase if _ml else 1,
+                        "raw_features": raw_features,
+                    })
+                    signal.alert_id = trade_alert_id
                 except Exception as _dbe:
                     logger.warning(f"Trade signal DB save failed (signal still fired): {_dbe}")
                     signal.alert_id = None
@@ -790,6 +863,37 @@ class SignalAggregator:
                         )
                     except Exception as _mle:
                         logger.debug(f"ML features save (trade signal) failed: {_mle}")
+
+                    # ── SetupScreener for TRADE_SIGNAL ─────────────────
+                    # Save setup_alerts linked to the TRADE alert_id so that
+                    # auto_labeler can propagate high-quality TradeOutcome labels
+                    # (T1/T2/T3/SL from real option P&L) directly to setup_alerts.
+                    # Early-move setup_alerts (above) use ATR heuristic labels only.
+                    try:
+                        _ts_hits = self._setup_screener.evaluate(
+                            index_name=index_name,
+                            direction=consensus_direction,
+                            timestamp=now,
+                            spot_price=spot_price,
+                            atr=atr,
+                            engines_count=engines_triggered,
+                            di_r=di_r,
+                            vol_r=vol_r,
+                            oc_r=oc_r,
+                            regime_r=regime_r,
+                            vwap_r=vwap_r,
+                            mtf_r=mtf_r,
+                            pcr=pcr,
+                        )
+                        if _ts_hits:
+                            self._db.save_setup_alerts(_ts_hits, alert_id=signal.alert_id)
+                            logger.debug(
+                                f"SetupScreener [TRADE {index_name}]: "
+                                f"{len(_ts_hits)} setups saved "
+                                f"(trade_alert_id={signal.alert_id})"
+                            )
+                    except Exception as _se:
+                        logger.warning(f"SetupScreener (trade signal) save failed: {_se}")
 
                 logger.info(f"TRADE SIGNAL: {index_name} {consensus_direction} "
                             f"→ {signal.suggested_instrument} "
@@ -865,15 +969,86 @@ class SignalAggregator:
 
     @staticmethod
     def _get_ml_prediction(raw_features: dict, direction: str):
+        """
+        Build a flat feature dict for ML prediction.
+
+        Uses explicit per-engine key mapping (same as _save_ml_features) to avoid
+        silent overwrites when two engine feature dicts share a key name.
+        Known collisions prevented:
+          "iv_rank"      — option_chain AND iv_expansion both expose this key
+          "volume_ratio" — volume_pressure AND liquidity_trap both expose this key
+          "adx"          — di_momentum AND market_regime both expose this key
+        """
         try:
             from ml.model_manager import get_model_manager
-            flat = {}
-            for section in raw_features.values():
-                if isinstance(section, dict):
-                    flat.update(section)
-            flat["spot_price"] = raw_features.get("spot_price", 0)
-            flat["atr"]        = raw_features.get("atr", 0)
-            flat["pcr"]        = raw_features.get("pcr", 0)
+            comp   = raw_features.get("compression",     {}) or {}
+            di     = raw_features.get("di_momentum",     {}) or {}
+            oc     = raw_features.get("option_chain",    {}) or {}
+            vol    = raw_features.get("volume_pressure", {}) or {}
+            liq    = raw_features.get("liquidity_trap",  {}) or {}
+            gamma  = raw_features.get("gamma_levels",    {}) or {}
+            iv     = raw_features.get("iv_expansion",    {}) or {}
+            vwap   = raw_features.get("vwap_pressure",   {}) or {}
+            regime = raw_features.get("market_regime",   {}) or {}
+
+            # Build flat dict with explicit column names — mirrors _save_ml_features exactly.
+            # Each value is sourced from the correct engine to prevent cross-engine collisions.
+            flat: dict = {
+                # Engine 1: Compression
+                "atr":               comp.get("atr_current", 0),
+                "atr_pct_change":    comp.get("atr_slope", 0),
+                "compression_ratio": comp.get("range_ratio", 1),
+                "candle_range_5":    comp.get("recent_avg_range", 0),
+                "candle_range_20":   comp.get("avg_20_range", 0),
+                # Engine 2: DI Momentum (sole source for adx, plus_di, minus_di)
+                "plus_di":           di.get("plus_di", 0),
+                "minus_di":          di.get("minus_di", 0),
+                "adx":               di.get("adx", 0),   # di_momentum only, not regime
+                "di_spread":         di.get("di_spread", 0),
+                "plus_di_slope":     di.get("spread_change", 0),
+                "minus_di_slope":    di.get(
+                    "minus_di_change",
+                    di.get("minus_di_slope", -di.get("spread_change", 0))
+                ),
+                # Engine 3: Option Chain (sole source for iv_rank = avg_call_iv)
+                "pcr":               oc.get("pcr", raw_features.get("pcr", 0)),
+                "pcr_change":        oc.get("pcr_change", 0),
+                "call_oi_change":    oc.get("call_oi_change", 0),
+                "put_oi_change":     oc.get("put_oi_change", 0),
+                "iv_rank":           oc.get("avg_call_iv", 0),  # option_chain only
+                "max_pain_distance": oc.get("max_pain_distance", 0),
+                # Engine 4: Volume Pressure (sole source for volume_ratio)
+                "volume_ratio":      vol.get("volume_ratio", 1),   # vol_pressure only
+                "volume_ratio_5":    vol.get("vol_5_mean_ratio", 1),
+                "is_small_candle":   vol.get("stealth_pattern", False),
+                # Engine 5: Liquidity Trap (liq_volume_ratio distinct from volume_ratio)
+                "liq_wick_ratio":    liq.get("wick_ratio_up", liq.get("wick_ratio_dn", 0)),
+                "liq_volume_ratio":  liq.get("volume_ratio", 1),
+                # Engine 6: Gamma Levels
+                "dist_to_gamma_wall": gamma.get("dist_to_gamma_wall", 1),
+                "dist_to_call_wall":  gamma.get("dist_to_call_wall", 1),
+                "dist_to_put_wall":   gamma.get("dist_to_put_wall", 1),
+                # Engine 7: IV Expansion (avg_atm_iv, not iv_rank — that comes from oc above)
+                "iv_expanding":      iv.get("iv_expanding", False),
+                "iv_skew_ratio":     iv.get("iv_skew_ratio", 1.0),
+                "avg_atm_iv":        iv.get("avg_atm_iv", 0),
+                "iv_change_pct":     iv.get("iv_change_pct", 0),
+                # VWAP Pressure
+                "vwap":              vwap.get("vwap", 0),
+                "dist_to_vwap_pct":  vwap.get("dist_to_vwap_pct", 0),
+                "vwap_cross_up":     vwap.get("vwap_cross_up", False),
+                "vwap_cross_down":   vwap.get("vwap_cross_down", False),
+                "vwap_bounce":       vwap.get("vwap_bounce", False),
+                "vwap_rejection":    vwap.get("vwap_rejection", False),
+                "vwap_vol_ratio":    vwap.get("vwap_vol_ratio", 0),
+                # Engine 8: Market Regime (regime_adx distinct from adx above)
+                "market_regime":     regime.get("regime", ""),
+                "regime_adx":        regime.get("adx", 0),   # regime engine only
+                "regime_atr_ratio":  regime.get("atr_ratio", 1),
+                # Top-level scalars
+                "spot_price":              raw_features.get("spot_price", 0),
+                "candle_completion_pct":   raw_features.get("candle_completion_pct", 0),
+            }
             return get_model_manager().predict(flat, direction)
         except Exception as e:
             import logging; logging.getLogger(__name__).debug(f"ML prediction skipped: {e}")
@@ -895,8 +1070,9 @@ class SignalAggregator:
           - Position sizing: recommended lots based on capital and risk %
           - Delta adjusted to actual strike (ATM=0.50, ITM=0.62)
         """
-        gap        = config.SYMBOL_MAP[index_name]["strike_gap"]
-        lot_size   = config.SYMBOL_MAP[index_name]["lot_size"]
+        _sym = config.SYMBOL_MAP.get(index_name, {})
+        gap        = _sym.get("strike_gap", 50)
+        lot_size   = _sym.get("lot_size", 1)
         atm_strike = chain.atm_strike if chain else round(spot / gap) * gap
         option_type = "CE" if direction == "BULLISH" else "PE"
 

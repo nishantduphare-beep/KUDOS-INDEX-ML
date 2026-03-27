@@ -279,6 +279,9 @@ class DataManager:
         self._last_purge_date: Optional[datetime] = None
         self._vix: float = 0.0          # India VIX — fetched every tick if available
 
+        # Option EOD price collection throttle — save at most once per minute per index
+        self._last_eod_price_save: Dict[str, datetime] = {}
+
     # ─── Public API ───────────────────────────────────────────────
 
     def add_update_callback(self, fn: Callable):
@@ -370,9 +373,20 @@ class DataManager:
 
     def reconnect(self, broker_name: str) -> bool:
         """Hot-swap broker at runtime (called from Credentials tab)."""
-        self.stop()
+        # Signal threads to stop; join with generous timeout.
+        # _running must be False before start() re-sets it to True so that
+        # any lingering old thread exits its loop naturally rather than racing
+        # with the new one sharing the same adapter instance.
+        self.stop()   # sets self._running = False and disconnects adapter
+        old_tick   = self._tick_thread
+        old_candle = self._candle_thread
+        self._tick_thread   = None
+        self._candle_thread = None
+        if old_tick and old_tick.is_alive():
+            old_tick.join(timeout=6)   # 2× candle interval for safety
+        if old_candle and old_candle.is_alive():
+            old_candle.join(timeout=6)
         config.BROKER = broker_name
-        time.sleep(0.5)
         return self.start()
 
     # ─── State accessors ──────────────────────────────────────────
@@ -500,10 +514,13 @@ class DataManager:
                             self._states[idx].lock_preopen_snapshot()
 
                     if oc_counter % oc_every_n == 0:
-                        chain = self._adapter.get_option_chain(idx)
-                        self._states[idx].update_option_chain(chain)
-                        self._persist_oc_snapshot(idx, chain)
-                        self._refresh_expiry_cache(idx)
+                        try:
+                            chain = self._adapter.get_option_chain(idx)
+                            self._states[idx].update_option_chain(chain)
+                            self._persist_oc_snapshot(idx, chain)
+                            self._refresh_expiry_cache(idx)
+                        except Exception as _oc_e:
+                            logger.warning(f"OC fetch failed [{idx}]: {_oc_e} — using stale chain")
 
                 oc_counter += 1
                 for cb in self._callbacks:
@@ -599,6 +616,70 @@ class DataManager:
             self._db.save_option_snapshot(snap)
         except Exception as e:
             logger.debug(f"OC persist error [{idx}]: {e}")
+
+        # Collect individual strike prices for EOD research (throttled to 1/min)
+        self._collect_option_eod_prices(idx, chain)
+
+    def _collect_option_eod_prices(self, idx: str, chain: OptionChain):
+        """
+        Save ATM ± 5 strikes' CE and PE prices to option_eod_prices table.
+        Throttled to once per minute per index to avoid DB flooding.
+        Covers: ltp, oi, iv, volume for both CE and PE at each strike.
+        """
+        try:
+            now = datetime.now()
+            last = self._last_eod_price_save.get(idx)
+            if last and (now - last).total_seconds() < 60:
+                return  # throttle — max once per minute per index
+
+            if not chain or not chain.strikes:
+                return
+
+            atm   = chain.atm_strike
+            gap   = 1  # strike_gap is in chain units; use index in sorted list
+
+            # Sort strikes and find ATM index
+            sorted_strikes = sorted(chain.strikes, key=lambda s: s.strike)
+            atm_values     = [s.strike for s in sorted_strikes]
+
+            # Find closest to ATM
+            atm_idx = min(range(len(atm_values)), key=lambda i: abs(atm_values[i] - atm))
+
+            # Collect ATM ± 5 strikes
+            rows = []
+            for offset in range(-5, 6):
+                si = atm_idx + offset
+                if si < 0 or si >= len(sorted_strikes):
+                    continue
+                s = sorted_strikes[si]
+                rows.append({
+                    "timestamp":     chain.timestamp,
+                    "index_name":    idx,
+                    "expiry":        chain.expiry,
+                    "spot_price":    float(chain.spot_price),
+                    "atm_strike":    float(atm),
+                    "strike":        float(s.strike),
+                    "strike_offset": offset,
+                    "call_ltp":      float(s.call_ltp),
+                    "call_oi":       float(s.call_oi),
+                    "call_iv":       float(s.call_iv),
+                    "call_volume":   float(s.call_volume),
+                    "put_ltp":       float(s.put_ltp),
+                    "put_oi":        float(s.put_oi),
+                    "put_iv":        float(s.put_iv),
+                    "put_volume":    float(s.put_volume),
+                    "created_at":    now,
+                })
+
+            if rows:
+                self._db.save_option_eod_prices(rows)
+                self._last_eod_price_save[idx] = now
+                logger.debug(
+                    f"OptionEOD [{idx}]: saved {len(rows)} strikes "
+                    f"(ATM={atm:.0f}, expiry={chain.expiry})"
+                )
+        except Exception as e:
+            logger.debug(f"OptionEOD collect error [{idx}]: {e}")
 
     def _persist_latest_futures_candle(self, idx: str, futures_candles: list):
         """

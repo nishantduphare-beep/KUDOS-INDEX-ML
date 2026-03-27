@@ -77,6 +77,15 @@ class OutcomeTracker:
 
     # ─── Public API ───────────────────────────────────────────────
 
+    def get_open_states(self) -> Dict[int, dict]:
+        """
+        Return a thread-safe snapshot of the currently open trade states.
+        Each value is a copy of the state dict keyed by outcome_id.
+        Used by OrderManager for paper P&L updates without accessing _lock directly.
+        """
+        with self._lock:
+            return {k: dict(v) for k, v in self._open.items()}
+
     def register(self, signal, alert_id: int) -> int:
         """
         Called immediately after a TRADE_SIGNAL fires.
@@ -115,8 +124,17 @@ class OutcomeTracker:
         opt_key = (f"{signal.index_name}:{int(strike)}:{option_type}"
                    if strike and option_type else None)
 
+        # Rupee P&L pre-computation — use lot size from config
+        lot_size = config.SYMBOL_MAP.get(signal.index_name, {}).get("lot_size", 1)
+        investment_amt = round(entry_price * lot_size, 2) if entry_price > 0 else 0.0
+        pnl_sl = round((stop_loss_opt  - entry_price) * lot_size, 2) if entry_price > 0 and stop_loss_opt  > 0 else 0.0
+        pnl_t1 = round((t1_opt         - entry_price) * lot_size, 2) if entry_price > 0 and t1_opt         > 0 else 0.0
+        pnl_t2 = round((t2_opt         - entry_price) * lot_size, 2) if entry_price > 0 and t2_opt         > 0 else 0.0
+        pnl_t3 = round((t3_opt         - entry_price) * lot_size, 2) if entry_price > 0 and t3_opt         > 0 else 0.0
+
         outcome_id = self._db.save_trade_outcome({
             "alert_id":      alert_id,
+            "alert_type":    getattr(signal, "alert_type", "TRADE_SIGNAL"),
             "index_name":    signal.index_name,
             "instrument":    getattr(signal, "suggested_instrument", ""),
             "direction":     signal.direction,
@@ -139,6 +157,12 @@ class OutcomeTracker:
             "mfe_atr":       0.0,
             "mae_atr":       0.0,
             "status":        "OPEN",
+            "lot_size":      lot_size,
+            "investment_amt": investment_amt,
+            "pnl_sl":        pnl_sl,
+            "pnl_t1":        pnl_t1,
+            "pnl_t2":        pnl_t2,
+            "pnl_t3":        pnl_t3,
         })
 
         state = {
@@ -166,6 +190,7 @@ class OutcomeTracker:
             "t3_hit":        False,
             "mfe_atr":       0.0,
             "mae_atr":       0.0,
+            "lot_size":      lot_size,
         }
 
         with self._lock:
@@ -382,17 +407,51 @@ class OutcomeTracker:
         else:
             outcome_str, label = "NEUTRAL", 0
 
+        # Compute realized P&L in rupees based on which level was hit.
+        # T2→SL case: after T2 hit we trail SL to entry (breakeven). In paper mode
+        # we model 50% booked at T2 + 50% closed at entry → partial win.
+        _entry_p   = state.get("entry_price", 0.0) or 0.0
+        _lot_size  = state.get("lot_size", 1) or 1
+        if _entry_p > 0:
+            if reason == "SL_HIT" and state["t2_hit"]:
+                # T2 was hit earlier → 50% booked at T2 premium, 50% closed at breakeven (entry)
+                _t2 = state.get("t2_opt", 0.0) or 0.0
+                realized_pnl = round((_t2 - _entry_p) * _lot_size * 0.5, 2) if _t2 > 0 else 0.0
+            elif reason == "SL_HIT":
+                # Pure SL: use the original stop_loss_opt level
+                # Note: after T2 hit, state["stop_loss_opt"] is trailed to entry_price;
+                # use opt_price (actual LTP at close) as the most accurate exit.
+                _exit_p = (opt_price or state.get("stop_loss_opt", 0.0)) or 0.0
+                realized_pnl = round((_exit_p - _entry_p) * _lot_size, 2) if _exit_p > 0 else 0.0
+            elif reason == "T3_HIT":
+                _exit_p = state.get("t3_opt", 0.0) or (opt_price or 0.0)
+                realized_pnl = round((_exit_p - _entry_p) * _lot_size, 2) if _exit_p > 0 else 0.0
+            elif state["t2_hit"]:
+                # Closed at/after T2 (EOD with T2 hit) — use actual price if available
+                _exit_p = (opt_price or state.get("t2_opt", 0.0)) or 0.0
+                realized_pnl = round((_exit_p - _entry_p) * _lot_size, 2) if _exit_p > 0 else 0.0
+            elif state["t1_hit"]:
+                _exit_p = (opt_price or state.get("t1_opt", 0.0)) or 0.0
+                realized_pnl = round((_exit_p - _entry_p) * _lot_size, 2) if _exit_p > 0 else 0.0
+            else:
+                # EOD or neutral — use actual option price if available
+                _exit_p = opt_price or 0.0
+                realized_pnl = round((_exit_p - _entry_p) * _lot_size, 2) if _exit_p > 0 else 0.0
+        else:
+            realized_pnl = 0.0
+
         updates = {
-            "status":      "CLOSED",
-            "exit_time":   now,
-            "exit_reason": reason,
-            "outcome":     outcome_str,
-            "sl_hit":      reason == "SL_HIT",
-            "t1_hit":      state["t1_hit"],
-            "t2_hit":      state["t2_hit"],
-            "t3_hit":      reason == "T3_HIT",
-            "mfe_atr":     round(state["mfe_atr"], 3),
-            "mae_atr":     round(state["mae_atr"], 3),
+            "status":       "CLOSED",
+            "exit_time":    now,
+            "exit_reason":  reason,
+            "outcome":      outcome_str,
+            "sl_hit":       reason == "SL_HIT",
+            "t1_hit":       state["t1_hit"],
+            "t2_hit":       state["t2_hit"],
+            "t3_hit":       reason == "T3_HIT",
+            "mfe_atr":      round(state["mfe_atr"], 3),
+            "mae_atr":      round(state["mae_atr"], 3),
+            "realized_pnl": realized_pnl,
         }
         if reason == "EOD":
             updates["eod_spot"] = spot
@@ -428,6 +487,7 @@ class OutcomeTracker:
                 max_favorable_atr = state["mfe_atr"],
                 max_adverse_atr   = state["mae_atr"],
                 candles_to_close  = candles_to_close,
+                realized_pnl      = realized_pnl,
             )
         except Exception as e:
             logger.error(f"OutcomeTracker DB write error: {e}")

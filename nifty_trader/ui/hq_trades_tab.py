@@ -90,6 +90,7 @@ class HQDetailPanel(QWidget):
         atype = "✅ CONFIRMED" if is_confirmed else "🎯 TRADE SIGNAL"
         dc    = "🟢 BULLISH" if alert_obj.direction == "BULLISH" else "🔴 BEARISH"
 
+        import config as _cfg
         entry  = getattr(alert_obj, "entry_reference",    0.0) or 0.0
         sl     = getattr(alert_obj, "stop_loss_reference", 0.0) or 0.0
         tgt    = getattr(alert_obj, "target_reference",   0.0) or 0.0
@@ -99,6 +100,16 @@ class HQDetailPanel(QWidget):
         instr  = getattr(alert_obj, "suggested_instrument", "—") or "—"
         eng_list = getattr(alert_obj, "engines_triggered", []) or []
 
+        lot_size = _cfg.SYMBOL_MAP.get(alert_obj.index_name, {}).get("lot_size", 1)
+        invest   = round(entry * lot_size, 2) if entry > 0 else 0.0
+        pnl_sl   = round((sl - entry) * lot_size, 2) if entry > 0 and sl > 0 else 0.0
+        pnl_t1   = round((t1 - entry) * lot_size, 2) if entry > 0 and t1 > 0 else 0.0
+        pnl_t2   = round((t2 - entry) * lot_size, 2) if entry > 0 and t2 > 0 else 0.0
+        pnl_t3   = round((t3 - entry) * lot_size, 2) if entry > 0 and t3 > 0 else 0.0
+
+        def _pnl(v):
+            return f"₹{v:+,.0f}" if v != 0 else "—"
+
         lines = [
             f"{'─' * 42}",
             f"  {atype}  |  {dc}",
@@ -106,14 +117,16 @@ class HQDetailPanel(QWidget):
             f"  {alert_obj.timestamp.strftime('%H:%M:%S  %d-%b-%Y')}",
             f"{'─' * 42}",
             f"  INSTRUMENT : {instr}",
+            f"  LOT SIZE   : {lot_size}",
+            f"  INVESTMENT : ₹{invest:,.0f}" if invest > 0 else "  INVESTMENT : —",
             f"  ENTRY      : {entry:.2f}",
-            f"  STOP LOSS  : {sl:.2f}",
-            f"  TARGET 1   : {t1:.2f}",
+            f"  STOP LOSS  : {sl:.2f}  ({_pnl(pnl_sl)})",
+            f"  TARGET 1   : {t1:.2f}  ({_pnl(pnl_t1)})",
         ]
         if t2:
-            lines.append(f"  TARGET 2   : {t2:.2f}")
+            lines.append(f"  TARGET 2   : {t2:.2f}  ({_pnl(pnl_t2)})")
         if t3:
-            lines.append(f"  TARGET 3   : {t3:.2f}")
+            lines.append(f"  TARGET 3   : {t3:.2f}  ({_pnl(pnl_t3)})")
 
         lines += [
             f"{'─' * 42}",
@@ -652,9 +665,12 @@ class HQTradesTab(QWidget):
                     func.date(Alert.timestamp) == today,
                     Alert.alert_type == "CONFIRMED_SIGNAL",
                 ).count()
+                # Filter to TRADE_SIGNAL only — CONFIRMED_SIGNAL rows track the
+                # same underlying move and would double-count wins/losses.
                 closed = s.query(TradeOutcome).filter(
                     func.date(TradeOutcome.created_at) == today,
                     TradeOutcome.status == "CLOSED",
+                    TradeOutcome.alert_type == "TRADE_SIGNAL",
                 ).all()
                 wins    = sum(1 for o in closed if o.outcome == "WIN")
                 win_rate = (wins / len(closed) * 100) if closed else 0.0

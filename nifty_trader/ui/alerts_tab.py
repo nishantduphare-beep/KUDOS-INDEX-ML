@@ -518,6 +518,50 @@ class TradeDetailPanel(QFrame):
             except Exception:
                 pass
 
+        # ── SETUPS FIRED ──────────────────────────────────────────
+        alert_id = getattr(a, "alert_id", 0)
+        if alert_id:
+            try:
+                setups = get_db().get_setups_for_alert(alert_id)
+                if setups:
+                    _grade_color = {
+                        "A++": "#ffd700", "A+": "#3fb950", "A": "#3fb950",
+                        "A-": "#a8ff78", "B": "#f0883e", "C-": "#8b949e", "D": "#484f58",
+                    }
+                    h += (
+                        "<div style='color:#8b949e;font-size:9px;letter-spacing:.5px;"
+                        "margin:8px 0 3px'>SETUPS FIRED</div>"
+                        "<div style='background:#1c1508;border:1px solid #30363d;"
+                        "border-radius:4px;padding:8px;font-size:11px'>"
+                        "<table style='width:100%;border-collapse:collapse'>"
+                    )
+                    for s in setups:
+                        gc = _grade_color.get(s["setup_grade"], "#8b949e")
+                        lbl_text = ""
+                        if s["label"] == 1:
+                            q = s["label_quality"]
+                            lbl_text = (
+                                " <span style='color:#3fb950'>T3✓</span>" if q >= 3
+                                else " <span style='color:#3fb950'>T2✓</span>" if q >= 2
+                                else " <span style='color:#a8ff78'>T1✓</span>"
+                            )
+                        elif s["label"] == 0:
+                            lbl_text = " <span style='color:#f85149'>SL✗</span>"
+                        h += (
+                            f"<tr>"
+                            f"<td style='padding:2px 0;width:30px'>"
+                            f"<span style='color:{gc};font-weight:bold;font-size:10px'>"
+                            f"{s['setup_grade']}</span></td>"
+                            f"<td style='color:#c9d1d9;padding:2px 4px'>{s['setup_name']}"
+                            f"{lbl_text}</td>"
+                            f"<td style='color:#8b949e;text-align:right;font-size:10px'>"
+                            f"exp {s['expected_wr']:.0f}%</td>"
+                            f"</tr>"
+                        )
+                    h += "</table></div>"
+            except Exception:
+                pass
+
         h += "</div>"
         self._body.setHtml(h)
 

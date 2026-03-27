@@ -623,9 +623,14 @@ class ModelManager:
 
 # ── Global singleton ─────────────────────────────────────────────
 _manager: Optional[ModelManager] = None
+_manager_lock = threading.Lock()
+
 
 def get_model_manager() -> ModelManager:
+    """Return the process-wide ModelManager singleton. Thread-safe (double-checked locking)."""
     global _manager
     if _manager is None:
-        _manager = ModelManager()
+        with _manager_lock:
+            if _manager is None:
+                _manager = ModelManager()
     return _manager

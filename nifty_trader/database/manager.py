@@ -10,12 +10,14 @@ from typing import List, Optional, Dict, Any
 from contextlib import contextmanager
 
 import numpy as np
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, Integer
 from sqlalchemy.orm import sessionmaker, Session
 
 
 def _sanitize_for_json(obj):
-    """Recursively convert numpy types to native Python for JSON serialization."""
+    """Recursively convert numpy types to native Python for JSON serialization.
+    Also replaces NaN/Inf (not valid JSON) with 0.0 to prevent json.dumps crashes.
+    """
     if isinstance(obj, dict):
         return {k: _sanitize_for_json(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -25,14 +27,18 @@ def _sanitize_for_json(obj):
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
-        return float(obj)
+        v = float(obj)
+        return 0.0 if (v != v or v == float("inf") or v == float("-inf")) else v
     if isinstance(obj, np.ndarray):
         return obj.tolist()
+    if isinstance(obj, float):
+        return 0.0 if (obj != obj or obj == float("inf") or obj == float("-inf")) else obj
     return obj
 
 from database.models import (
     Base, MarketCandle, OptionChainSnapshot,
-    EngineSignal, Alert, TradeOutcome, MLFeatureRecord
+    EngineSignal, Alert, TradeOutcome, MLFeatureRecord,
+    OptionPriceHistory, SetupAlert, OptionEODPrice, S11PaperTrade,
 )
 import config
 
@@ -43,11 +49,19 @@ class DatabaseManager:
     """Thread-safe SQLite database manager."""
 
     def __init__(self, db_path: str = config.DB_PATH):
+        from sqlalchemy import event as _sa_event
         self.engine = create_engine(
             f"sqlite:///{db_path}",
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "timeout": 30},
             echo=config.DB_ECHO
         )
+        # Enable WAL mode + 30s busy timeout to prevent "database is locked" under concurrent writes
+        @_sa_event.listens_for(self.engine, "connect")
+        def _set_sqlite_pragmas(dbapi_conn, _):
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA busy_timeout=30000")
+            cur.close()
         self.SessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=self.engine
         )
@@ -62,6 +76,9 @@ class DatabaseManager:
         self._migrate_ml_feature_outcomes()
         self._migrate_alerts()
         self._migrate_indexes()
+        self._migrate_setup_alerts()
+        self._migrate_option_eod_prices()
+        self._migrate_s11_paper_trades()
         logger.info("Database initialized")
 
     def _migrate_ml_feature_store(self):
@@ -224,6 +241,16 @@ class DatabaseManager:
             "mae_atr":         "FLOAT DEFAULT 0",
             "eod_spot":        "FLOAT",
             "status":          "VARCHAR(10) DEFAULT 'OPEN'",
+            # ── Rupee P&L tracking ──────────────────────────────────
+            "lot_size":        "INTEGER DEFAULT 0",
+            "investment_amt":  "FLOAT DEFAULT 0",   # entry_premium × lot_size
+            "pnl_sl":          "FLOAT DEFAULT 0",   # rupees if SL hit (negative)
+            "pnl_t1":          "FLOAT DEFAULT 0",   # rupees if T1 hit
+            "pnl_t2":          "FLOAT DEFAULT 0",   # rupees if T2 hit
+            "pnl_t3":          "FLOAT DEFAULT 0",   # rupees if T3 hit
+            "realized_pnl":    "FLOAT DEFAULT 0",   # actual rupees at close
+            # ── Alert type tag ──────────────────────────────────────
+            "alert_type":      "VARCHAR(20) DEFAULT 'TRADE_SIGNAL'",
         }
         try:
             with self.engine.connect() as conn:
@@ -305,6 +332,94 @@ class DatabaseManager:
                 conn.commit()
         except Exception as e:
             logger.warning(f"Index migration: {e}")
+
+    def _migrate_setup_alerts(self):
+        """Create setup_alerts table and indexes if they don't exist (idempotent)."""
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS setup_alerts (
+                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                        alert_id      INTEGER REFERENCES alerts(id),
+                        index_name    VARCHAR(20) NOT NULL,
+                        timestamp     DATETIME NOT NULL,
+                        direction     VARCHAR(10) NOT NULL,
+                        setup_name    VARCHAR(40) NOT NULL,
+                        setup_grade   VARCHAR(4)  NOT NULL,
+                        expected_wr   FLOAT NOT NULL,
+                        description   VARCHAR(120),
+                        spot_price    FLOAT DEFAULT 0,
+                        atr           FLOAT DEFAULT 0,
+                        engines_count INTEGER DEFAULT 0,
+                        regime        VARCHAR(15),
+                        volume_ratio  FLOAT DEFAULT 0,
+                        pcr           FLOAT DEFAULT 0,
+                        label         INTEGER DEFAULT -1,
+                        label_quality INTEGER DEFAULT -1,
+                        t1_hit        BOOLEAN DEFAULT 0,
+                        t2_hit        BOOLEAN DEFAULT 0,
+                        t3_hit        BOOLEAN DEFAULT 0,
+                        sl_hit        BOOLEAN DEFAULT 0,
+                        realized_pnl  FLOAT DEFAULT 0,
+                        created_at    DATETIME
+                    )
+                """))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_setup_alerts_index_ts "
+                    "ON setup_alerts(index_name, timestamp)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_setup_alerts_name_label "
+                    "ON setup_alerts(setup_name, label)"
+                ))
+                # Idempotent: add realized_pnl column if missing (existing DBs)
+                existing_sa = {
+                    row[1] for row in conn.execute(text("PRAGMA table_info(setup_alerts)"))
+                }
+                if "realized_pnl" not in existing_sa:
+                    conn.execute(text(
+                        "ALTER TABLE setup_alerts ADD COLUMN realized_pnl FLOAT DEFAULT 0"
+                    ))
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"setup_alerts migration: {e}")
+
+    def _migrate_option_eod_prices(self):
+        """Create option_eod_prices table if it doesn't exist (idempotent)."""
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS option_eod_prices (
+                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp     DATETIME NOT NULL,
+                        index_name    VARCHAR(20) NOT NULL,
+                        expiry        VARCHAR(15) NOT NULL,
+                        spot_price    FLOAT DEFAULT 0,
+                        atm_strike    FLOAT DEFAULT 0,
+                        strike        FLOAT NOT NULL,
+                        strike_offset INTEGER DEFAULT 0,
+                        call_ltp      FLOAT DEFAULT 0,
+                        call_oi       FLOAT DEFAULT 0,
+                        call_iv       FLOAT DEFAULT 0,
+                        call_volume   FLOAT DEFAULT 0,
+                        put_ltp       FLOAT DEFAULT 0,
+                        put_oi        FLOAT DEFAULT 0,
+                        put_iv        FLOAT DEFAULT 0,
+                        put_volume    FLOAT DEFAULT 0,
+                        created_at    DATETIME
+                    )
+                """))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_eod_index_ts "
+                    "ON option_eod_prices(index_name, timestamp)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_eod_strike_ts "
+                    "ON option_eod_prices(index_name, strike, timestamp)"
+                ))
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"option_eod_prices migration: {e}")
 
     def _migrate_market_candles(self):
         """Add oi and is_futures columns to market_candles if missing (idempotent)."""
@@ -407,7 +522,7 @@ class DatabaseManager:
         Used to reconstruct how OI evolved through the session.
         """
         if ref_date is None:
-            ref_date = datetime.utcnow().date()
+            ref_date = datetime.now().date()
         day_start = datetime(ref_date.year, ref_date.month, ref_date.day)
         day_end   = day_start + timedelta(days=1)
         with self.get_session() as session:
@@ -466,9 +581,9 @@ class DatabaseManager:
     def get_engine_signals(
         self, index_name: str, since_minutes: int = 15
     ) -> List[EngineSignal]:
-        since = datetime.utcnow() - timedelta(minutes=since_minutes)
+        since = datetime.now() - timedelta(minutes=since_minutes)
         with self.get_session() as session:
-            return (
+            rows = (
                 session.query(EngineSignal)
                 .filter(
                     EngineSignal.index_name == index_name,
@@ -477,6 +592,147 @@ class DatabaseManager:
                 .order_by(EngineSignal.timestamp.desc())
                 .all()
             )
+            session.expunge_all()
+            return rows
+
+    # ─── SETUP ALERTS ──────────────────────────────────────────────
+
+    def save_setup_alerts(self, hits: list, alert_id: int = 0) -> int:
+        """
+        Save a batch of SetupHit objects to setup_alerts table.
+        Returns number of rows inserted.
+        hits: list of SetupHit from SetupScreener.evaluate()
+        """
+        if not hits:
+            return 0
+        rows = []
+        for h in hits:
+            rows.append({
+                "alert_id":      alert_id or None,
+                "index_name":    h.index_name,
+                "timestamp":     h.timestamp,
+                "direction":     h.direction,
+                "setup_name":    h.setup_name,
+                "setup_grade":   h.setup_grade,
+                "expected_wr":   h.expected_wr,
+                "description":   h.description,
+                "spot_price":    float(h.spot_price),
+                "atr":           float(h.atr),
+                "engines_count": int(h.engines_count),
+                "regime":        h.regime,
+                "volume_ratio":  float(h.volume_ratio),
+                "pcr":           float(h.pcr),
+                "label":         -1,
+                "label_quality": -1,
+                "created_at":    datetime.utcnow(),
+            })
+        try:
+            with self.get_session() as session:
+                session.bulk_insert_mappings(SetupAlert, rows)
+            return len(rows)
+        except Exception as e:
+            logger.warning(f"save_setup_alerts failed: {e}")
+            return 0
+
+    def get_setups_for_alert(self, alert_id: int) -> List[Dict[str, Any]]:
+        """Return all setup_alerts rows for a given alert_id (for UI display)."""
+        try:
+            with self.get_session() as session:
+                rows = (
+                    session.query(SetupAlert)
+                    .filter(SetupAlert.alert_id == alert_id)
+                    .order_by(SetupAlert.setup_grade)
+                    .all()
+                )
+                return [
+                    {
+                        "setup_name":   r.setup_name,
+                        "setup_grade":  r.setup_grade,
+                        "expected_wr":  r.expected_wr,
+                        "label":        r.label,
+                        "label_quality": r.label_quality,
+                        "t2_hit":       r.t2_hit,
+                        "t3_hit":       r.t3_hit,
+                        "sl_hit":       r.sl_hit,
+                    }
+                    for r in rows
+                ]
+        except Exception as e:
+            logger.warning(f"get_setups_for_alert: {e}")
+            return []
+
+    def get_setup_alert_stats(self) -> List[Dict[str, Any]]:
+        """
+        Returns win rate stats per setup — for reporting and ML.
+        Only includes setups with label >= 0 (labeled records).
+        """
+        try:
+            with self.get_session() as session:
+                from sqlalchemy import func
+                rows = (
+                    session.query(
+                        SetupAlert.setup_name,
+                        SetupAlert.setup_grade,
+                        SetupAlert.expected_wr,
+                        func.count(SetupAlert.id).label("total"),
+                        func.sum(
+                            (SetupAlert.label == 1).cast(Integer)
+                        ).label("wins"),
+                        func.avg(SetupAlert.label_quality).label("avg_quality"),
+                        func.sum(
+                            (SetupAlert.t2_hit == True).cast(Integer)  # noqa: E712
+                        ).label("t2_count"),
+                        func.sum(
+                            (SetupAlert.t3_hit == True).cast(Integer)  # noqa: E712
+                        ).label("t3_count"),
+                        func.sum(SetupAlert.realized_pnl).label("total_pnl"),
+                        func.avg(SetupAlert.realized_pnl).label("avg_pnl"),
+                    )
+                    .filter(SetupAlert.label >= 0)
+                    .group_by(SetupAlert.setup_name)
+                    .order_by(func.count(SetupAlert.id).desc())
+                    .all()
+                )
+                result = []
+                for r in rows:
+                    total = r.total or 0
+                    wins  = r.wins  or 0
+                    wr    = (wins / total * 100) if total > 0 else 0.0
+                    result.append({
+                        "setup_name":   r.setup_name,
+                        "setup_grade":  r.setup_grade,
+                        "expected_wr":  r.expected_wr,
+                        "total":        total,
+                        "wins":         wins,
+                        "actual_wr":    round(wr, 1),
+                        "avg_quality":  round(float(r.avg_quality or 0), 2),
+                        "t2_count":     r.t2_count or 0,
+                        "t3_count":     r.t3_count or 0,
+                        "total_pnl":    round(float(r.total_pnl or 0), 2),
+                        "avg_pnl":      round(float(r.avg_pnl or 0), 2),
+                    })
+                return result
+        except Exception as e:
+            logger.warning(f"get_setup_alert_stats: {e}")
+            return []
+
+    # ─── OPTION EOD PRICES ─────────────────────────────────────────
+
+    def save_option_eod_prices(self, rows: List[Dict[str, Any]]) -> int:
+        """
+        Bulk-insert option strike prices (ATM ± N strikes) from a chain update.
+        rows: list of dicts with keys matching option_eod_prices columns.
+        Returns number of rows inserted.
+        """
+        if not rows:
+            return 0
+        try:
+            with self.get_session() as session:
+                session.bulk_insert_mappings(OptionEODPrice, rows)
+            return len(rows)
+        except Exception as e:
+            logger.warning(f"save_option_eod_prices failed: {e}")
+            return 0
 
     # ─── ALERTS ────────────────────────────────────────────────────
 
@@ -524,7 +780,6 @@ class DatabaseManager:
     def save_option_price(self, alert_id: int, instrument: str, timestamp,
                           ltp: float, entry_price: float, candle_num: int):
         """Store one option LTP data point for a tracked signal."""
-        from database.models import OptionPriceHistory
         pct = round((ltp - entry_price) / max(entry_price, 0.01) * 100, 3) if entry_price else 0.0
         with self.get_session() as session:
             session.add(OptionPriceHistory(
@@ -539,7 +794,6 @@ class DatabaseManager:
 
     def get_option_price_history(self, alert_id: int) -> list:
         """Return all LTP records for a given alert, ordered by candle_num."""
-        from database.models import OptionPriceHistory
         with self.get_session() as session:
             rows = session.query(OptionPriceHistory).filter(
                 OptionPriceHistory.alert_id == alert_id
@@ -552,8 +806,6 @@ class DatabaseManager:
         """Return option price histories for multiple alert_ids as dict keyed by alert_id."""
         if not alert_ids:
             return {}
-        from database.models import OptionPriceHistory
-        from sqlalchemy import and_
         with self.get_session() as session:
             rows = session.query(OptionPriceHistory).filter(
                 OptionPriceHistory.alert_id.in_(alert_ids)
@@ -647,6 +899,7 @@ class DatabaseManager:
         max_favorable_atr: float,
         max_adverse_atr: float,
         candles_to_close: float = 0.0,
+        realized_pnl: float = 0.0,
     ):
         """
         Write outcome feedback into the ML feature record for this alert.
@@ -677,10 +930,20 @@ class DatabaseManager:
             # SL hit, or slow target hit (theta eroded option value)
             label = 0
 
+        # Compute graded quality from hit flags (mirrors auto_labeler logic)
+        if t3_hit:
+            quality = 3
+        elif t2_hit:
+            quality = 2
+        elif t1_hit:
+            quality = 1
+        else:
+            quality = 0  # SL hit or no move
+
         outcome_str = "WIN" if label == 1 else "LOSS"
 
         with self.get_session() as session:
-            from database.models import MLFeatureRecord, Alert as AlertModel
+            AlertModel = Alert   # alias for readability
             rec = session.query(MLFeatureRecord).filter(
                 MLFeatureRecord.alert_id == alert_id
             ).first()
@@ -693,6 +956,23 @@ class DatabaseManager:
                 rec.max_adverse_atr   = max_adverse_atr
                 rec.candles_to_close  = candles_to_close
                 rec.label             = label
+                rec.label_quality     = quality
+
+            # Propagate outcome to setup_alerts linked to this alert_id.
+            # update_ml_feature_outcome() bypasses auto_labeler (sets label directly),
+            # so we must propagate here — auto_labeler only touches label==-1 records.
+            session.query(SetupAlert).filter(
+                SetupAlert.alert_id == alert_id,
+                SetupAlert.label == -1,
+            ).update({
+                "label":         label,
+                "label_quality": quality,
+                "t1_hit":        t1_hit,
+                "t2_hit":        t2_hit,
+                "t3_hit":        t3_hit,
+                "sl_hit":        sl_hit,
+                "realized_pnl":  realized_pnl,
+            }, synchronize_session=False)
 
             # Also update parent Alert outcome
             alert = session.query(AlertModel).filter(AlertModel.id == alert_id).first()
@@ -737,7 +1017,6 @@ class DatabaseManager:
                 row.post_sl_full_recovery   = post_sl_full_recovery
 
             # Patch ML feature record
-            from database.models import MLFeatureRecord
             rec = session.query(MLFeatureRecord).filter(
                 MLFeatureRecord.alert_id == alert_id
             ).first()
@@ -791,6 +1070,161 @@ class DatabaseManager:
                 "avg_mae_atr": round(row.avg_mae or 0, 2),
             }
 
+    def _migrate_s11_paper_trades(self):
+        """Create s11_paper_trades table and indexes if they don't exist (idempotent).
+        Base.metadata.create_all() handles new installs; this handles existing DBs."""
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS s11_paper_trades (
+                        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                        alert_id         INTEGER DEFAULT 0,
+                        index_name       VARCHAR(20) NOT NULL,
+                        direction        VARCHAR(10) NOT NULL,
+                        confidence_score FLOAT  DEFAULT 0.0,
+                        date             VARCHAR(12) NOT NULL,
+                        entry_time       DATETIME NOT NULL,
+                        entry_spot       FLOAT  DEFAULT 0.0,
+                        entry_price      FLOAT  DEFAULT 0.0,
+                        instrument       VARCHAR(50) DEFAULT '',
+                        strike           FLOAT  DEFAULT 0.0,
+                        option_type      VARCHAR(4) DEFAULT '',
+                        atr_at_signal    FLOAT  DEFAULT 0.0,
+                        lot_size         INTEGER DEFAULT 0,
+                        lots             INTEGER DEFAULT 2,
+                        units            INTEGER DEFAULT 0,
+                        sl_price         FLOAT  DEFAULT 0.0,
+                        t1_price         FLOAT  DEFAULT 0.0,
+                        t2_price         FLOAT  DEFAULT 0.0,
+                        t3_price         FLOAT  DEFAULT 0.0,
+                        spot_sl          FLOAT  DEFAULT 0.0,
+                        spot_t1          FLOAT  DEFAULT 0.0,
+                        spot_t2          FLOAT  DEFAULT 0.0,
+                        spot_t3          FLOAT  DEFAULT 0.0,
+                        pnl_at_sl        FLOAT  DEFAULT 0.0,
+                        pnl_at_t1        FLOAT  DEFAULT 0.0,
+                        pnl_at_t2        FLOAT  DEFAULT 0.0,
+                        pnl_at_t3        FLOAT  DEFAULT 0.0,
+                        t1_hit           BOOLEAN DEFAULT 0,
+                        t1_hit_time      DATETIME,
+                        t2_hit           BOOLEAN DEFAULT 0,
+                        t2_hit_time      DATETIME,
+                        t3_hit           BOOLEAN DEFAULT 0,
+                        t3_hit_time      DATETIME,
+                        sl_hit           BOOLEAN DEFAULT 0,
+                        sl_hit_time      DATETIME,
+                        mfe_atr          FLOAT  DEFAULT 0.0,
+                        mae_atr          FLOAT  DEFAULT 0.0,
+                        status           VARCHAR(10) DEFAULT 'OPEN',
+                        exit_time        DATETIME,
+                        exit_price       FLOAT  DEFAULT 0.0,
+                        exit_spot        FLOAT  DEFAULT 0.0,
+                        exit_reason      VARCHAR(20) DEFAULT '',
+                        outcome          VARCHAR(10) DEFAULT '',
+                        realized_pnl     FLOAT  DEFAULT 0.0,
+                        created_at       DATETIME
+                    )
+                """))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_s11_index_date "
+                    "ON s11_paper_trades(index_name, date)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_s11_status "
+                    "ON s11_paper_trades(status)"
+                ))
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"s11_paper_trades migration: {e}")
+
+    # ─── S11 PAPER TRADES ──────────────────────────────────────────
+
+    def save_s11_paper_trade(self, data: Dict[str, Any]) -> int:
+        """Insert a new S11PaperTrade row. Returns its id."""
+        valid_cols = {c.name for c in S11PaperTrade.__table__.columns}
+        row_data = {k: v for k, v in data.items() if k in valid_cols}
+        with self.get_session() as session:
+            row = S11PaperTrade(**row_data)
+            session.add(row)
+            session.flush()
+            return row.id
+
+    def update_s11_paper_trade(self, trade_id: int, updates: Dict[str, Any]):
+        """Patch an existing S11PaperTrade row with arbitrary field updates."""
+        with self.get_session() as session:
+            row = session.query(S11PaperTrade).filter(
+                S11PaperTrade.id == trade_id
+            ).first()
+            if row:
+                for k, v in updates.items():
+                    setattr(row, k, v)
+
+    def get_open_s11_trades(self) -> List[S11PaperTrade]:
+        """Return all OPEN S11PaperTrade rows — used by S11Monitor on startup (rehydrate)."""
+        with self.get_session() as session:
+            rows = (
+                session.query(S11PaperTrade)
+                .filter(S11PaperTrade.status == "OPEN")
+                .order_by(S11PaperTrade.entry_time)
+                .all()
+            )
+            session.expunge_all()
+            return rows
+
+    def get_s11_trades_by_date(self, date_str: str) -> List[S11PaperTrade]:
+        """Return all S11PaperTrade rows for a given date string 'YYYY-MM-DD'."""
+        with self.get_session() as session:
+            rows = (
+                session.query(S11PaperTrade)
+                .filter(S11PaperTrade.date == date_str)
+                .order_by(S11PaperTrade.entry_time)
+                .all()
+            )
+            session.expunge_all()
+            return rows
+
+    def get_s11_stats(self) -> Dict[str, Any]:
+        """Aggregate S11 paper trade stats: total, wins, losses, T1/T2/T3 rates, P&L."""
+        from sqlalchemy import func, case
+        with self.get_session() as session:
+            row = session.query(
+                func.count().label("total"),
+                func.sum(case((S11PaperTrade.sl_hit  == True,  1), else_=0)).label("sl_cnt"),   # noqa
+                func.sum(case((S11PaperTrade.t1_hit  == True,  1), else_=0)).label("t1_cnt"),   # noqa
+                func.sum(case((S11PaperTrade.t2_hit  == True,  1), else_=0)).label("t2_cnt"),   # noqa
+                func.sum(case((S11PaperTrade.t3_hit  == True,  1), else_=0)).label("t3_cnt"),   # noqa
+                func.sum(case((S11PaperTrade.outcome == "WIN",  1), else_=0)).label("wins"),
+                func.sum(case((S11PaperTrade.outcome == "LOSS", 1), else_=0)).label("losses"),
+                func.sum(S11PaperTrade.realized_pnl).label("total_pnl"),
+                func.avg(S11PaperTrade.mfe_atr).label("avg_mfe"),
+                func.avg(S11PaperTrade.mae_atr).label("avg_mae"),
+            ).filter(S11PaperTrade.status == "CLOSED").one()
+
+            total   = row.total   or 0
+            sl_cnt  = row.sl_cnt  or 0
+            t1_cnt  = row.t1_cnt  or 0
+            t2_cnt  = row.t2_cnt  or 0
+            t3_cnt  = row.t3_cnt  or 0
+            wins    = row.wins    or 0
+            losses  = row.losses  or 0
+            return {
+                "total":     total,
+                "sl_count":  sl_cnt,
+                "t1_count":  t1_cnt,
+                "t2_count":  t2_cnt,
+                "t3_count":  t3_cnt,
+                "wins":      wins,
+                "losses":    losses,
+                "win_rate":  round(wins / max(wins + losses, 1) * 100, 1),
+                "t1_rate":   round(t1_cnt / max(total, 1) * 100, 1),
+                "t2_rate":   round(t2_cnt / max(total, 1) * 100, 1),
+                "t3_rate":   round(t3_cnt / max(total, 1) * 100, 1),
+                "sl_rate":   round(sl_cnt / max(total, 1) * 100, 1),
+                "total_pnl": round(float(row.total_pnl or 0), 2),
+                "avg_mfe_atr": round(float(row.avg_mfe or 0), 2),
+                "avg_mae_atr": round(float(row.avg_mae or 0), 2),
+            }
+
     # ─── RETENTION / PURGE ────────────────────────────────────────
 
     def purge_old_data(self) -> Dict[str, int]:
@@ -834,7 +1268,7 @@ class DatabaseManager:
     def get_alert_stats(self) -> Dict[str, Any]:
         from sqlalchemy import func, case
         with self.get_session() as session:
-            today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
             row = session.query(
                 func.count().label("total"),
                 func.sum(case((Alert.outcome == "WIN",  1), else_=0)).label("wins"),
@@ -853,12 +1287,15 @@ class DatabaseManager:
             }
 
 
-# Global singleton
+# Global singleton (thread-safe initialization)
 _db: Optional[DatabaseManager] = None
+_db_lock = __import__("threading").Lock()
 
 
 def get_db() -> DatabaseManager:
     global _db
     if _db is None:
-        _db = DatabaseManager()
+        with _db_lock:
+            if _db is None:  # double-checked locking
+                _db = DatabaseManager()
     return _db

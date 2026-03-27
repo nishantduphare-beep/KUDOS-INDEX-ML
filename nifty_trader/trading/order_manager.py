@@ -150,6 +150,7 @@ class OrderManager:
         self._today_date   = date.today()
         # Fyers API instance (lazy-loaded from adapter, only used in LIVE mode)
         self._fyers        = None
+        self._fyers_failed_at: Optional[datetime] = None   # backoff on repeated failures
         # Per-index dedup: do not place a second order for the same alert_id
         self._placed_alert_ids: set = set()
         # OutcomeTracker reference — injected from main_window for paper P&L
@@ -394,10 +395,9 @@ class OrderManager:
         if ot is None:
             return
         try:
-            # Snapshot OutcomeTracker state (thread-safe)
-            with ot._lock:
-                open_ot   = dict(ot._open)
-                closed_db = {}   # we need DB for already-closed outcomes
+            # Snapshot open states via the public API — no direct lock access
+            open_ot   = ot.get_open_states()
+            closed_db = {}   # we need DB for already-closed outcomes
 
             with self._lock:
                 for oid, rec in list(self._open_orders.items()):
@@ -550,20 +550,29 @@ class OrderManager:
                 logger.info("AutoTrade: new trading day — daily counters reset")
 
     def _get_fyers(self):
-        """Lazily fetch the live Fyers API handle from the adapter."""
+        """
+        Lazily fetch the live Fyers API handle from the adapter.
+        On failure, backs off for 60 s before retrying so repeated errors
+        do not re-read the token file on every refresh cycle.
+        """
         if self._fyers is not None:
             return self._fyers
+        # Backoff: don't retry within 60 s of a known failure
+        if self._fyers_failed_at is not None:
+            elapsed = (datetime.now() - self._fyers_failed_at).total_seconds()
+            if elapsed < 60:
+                return None
         try:
             from data.adapters.fyers_adapter import FyersAdapter
-            # FyersAdapter is a singleton via the data manager; access its _fyers handle
-            # by re-creating one and connecting with the cached token.
             adapter = FyersAdapter()
             adapter.connect()
             if adapter._fyers:
                 self._fyers = adapter._fyers
+                self._fyers_failed_at = None
                 return self._fyers
         except Exception as e:
             logger.debug(f"AutoTrade: _get_fyers error: {e}")
+        self._fyers_failed_at = datetime.now()
         return None
 
     def _build_order(self, signal, expiry: str = "",

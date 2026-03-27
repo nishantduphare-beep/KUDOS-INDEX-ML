@@ -239,6 +239,18 @@ class TradeOutcome(Base):
     pnl              = Column(Float)
     pnl_percent      = Column(Float)
 
+    # Rupee P&L tracking
+    lot_size         = Column(Integer, default=0)
+    investment_amt   = Column(Float,   default=0.0)  # entry_price × lot_size
+    pnl_sl           = Column(Float,   default=0.0)  # expected loss at SL in ₹
+    pnl_t1           = Column(Float,   default=0.0)  # expected profit at T1 in ₹
+    pnl_t2           = Column(Float,   default=0.0)  # expected profit at T2 in ₹
+    pnl_t3           = Column(Float,   default=0.0)  # expected profit at T3 in ₹
+    realized_pnl     = Column(Float,   default=0.0)  # actual P&L at close in ₹
+
+    # Alert type — distinguishes raw vs candle-close-confirmed entries for stats
+    alert_type       = Column(String(20), default="TRADE_SIGNAL")  # TRADE_SIGNAL / CONFIRMED_SIGNAL
+
     # Status
     status           = Column(String(10), default="OPEN")  # OPEN / CLOSED
 
@@ -468,4 +480,181 @@ class MLFeatureRecord(Base):
 
     __table_args__ = (
         Index("idx_ml_index_label_ts", "index_name", "label", "timestamp"),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# 8. SETUP ALERTS
+# One row per named setup that fires per candle.
+# Links to alerts table via alert_id.
+# Auto-labeler will fill label/label_quality/t1_hit/t2_hit/t3_hit.
+# ──────────────────────────────────────────────────────────────────
+class SetupAlert(Base):
+    __tablename__ = "setup_alerts"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Link to the alert that triggered this setup evaluation
+    alert_id      = Column(Integer, ForeignKey("alerts.id"), nullable=True)
+
+    # Signal identity
+    index_name    = Column(String(20), nullable=False)
+    timestamp     = Column(DateTime,   nullable=False)
+    direction     = Column(String(10), nullable=False)  # BULLISH / BEARISH
+
+    # Setup identity
+    setup_name    = Column(String(40), nullable=False)
+    setup_grade   = Column(String(4),  nullable=False)  # A++ / A+ / A / B / C- / D
+    expected_wr   = Column(Float,      nullable=False)  # Tested WR% at definition time
+    description   = Column(String(120))
+
+    # Market state at signal time
+    spot_price    = Column(Float, default=0.0)
+    atr           = Column(Float, default=0.0)
+    engines_count = Column(Integer, default=0)
+    regime        = Column(String(15))           # TRENDING / RANGING / AMBIGUOUS
+    volume_ratio  = Column(Float, default=0.0)
+    pcr           = Column(Float, default=0.0)
+
+    # Labels — filled by auto_labeler as outcomes become known
+    label         = Column(Integer, default=-1)  # -1=unlabeled, 0=loss, 1=win
+    label_quality = Column(Integer, default=-1)  # -1=unlabeled, 0=SL, 1=T1, 2=T2, 3=T3
+    t1_hit        = Column(Boolean, default=False)
+    t2_hit        = Column(Boolean, default=False)
+    t3_hit        = Column(Boolean, default=False)
+    sl_hit        = Column(Boolean, default=False)
+    realized_pnl  = Column(Float,   default=0.0)  # actual P&L at close in ₹
+
+    created_at    = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_setup_alerts_index_ts",   "index_name", "timestamp"),
+        Index("idx_setup_alerts_name_label",  "setup_name", "label"),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# 9. S11 PAPER TRADES
+# Paper trade tracking for S11 setup (DI + Trending + HighVol >= 1.5×).
+# Completely separate from trade_outcomes — never mixed, independently queryable.
+# 2 lots per trade. T2 hit → trail SL to entry. T3 hit → full close.
+# ──────────────────────────────────────────────────────────────────
+class S11PaperTrade(Base):
+    __tablename__ = "s11_paper_trades"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Link to source alert (alert_id may be 0 for confirmed signals — set async)
+    alert_id        = Column(Integer, default=0)
+
+    # Signal identity
+    index_name      = Column(String(20), nullable=False)
+    direction       = Column(String(10), nullable=False)   # BULLISH / BEARISH
+    confidence_score= Column(Float,  default=0.0)
+    date            = Column(String(12), nullable=False)   # "YYYY-MM-DD" for daily grouping
+
+    # Entry state
+    entry_time      = Column(DateTime,  nullable=False)
+    entry_spot      = Column(Float,     default=0.0)
+    entry_price     = Column(Float,     default=0.0)  # option premium at entry
+    instrument      = Column(String(50),default="")   # e.g. NIFTY30MAR2024500CE
+    strike          = Column(Float,     default=0.0)
+    option_type     = Column(String(4), default="")   # CE / PE
+    atr_at_signal   = Column(Float,     default=0.0)
+
+    # Sizing — 2 lots
+    lot_size        = Column(Integer,   default=0)    # per lot (from config at signal time)
+    lots            = Column(Integer,   default=2)    # always 2
+    units           = Column(Integer,   default=0)    # lots × lot_size
+
+    # Option premium levels
+    sl_price        = Column(Float, default=0.0)
+    t1_price        = Column(Float, default=0.0)
+    t2_price        = Column(Float, default=0.0)
+    t3_price        = Column(Float, default=0.0)
+
+    # Spot reference levels (for display + post-close analysis)
+    spot_sl         = Column(Float, default=0.0)
+    spot_t1         = Column(Float, default=0.0)
+    spot_t2         = Column(Float, default=0.0)
+    spot_t3         = Column(Float, default=0.0)
+
+    # Pre-computed P&L in rupees (units × move)
+    pnl_at_sl       = Column(Float, default=0.0)   # expected loss at SL
+    pnl_at_t1       = Column(Float, default=0.0)
+    pnl_at_t2       = Column(Float, default=0.0)   # expected profit at T2
+    pnl_at_t3       = Column(Float, default=0.0)
+
+    # Level hit milestones
+    t1_hit          = Column(Boolean, default=False)
+    t1_hit_time     = Column(DateTime)
+    t2_hit          = Column(Boolean, default=False)
+    t2_hit_time     = Column(DateTime)
+    t3_hit          = Column(Boolean, default=False)
+    t3_hit_time     = Column(DateTime)
+    sl_hit          = Column(Boolean, default=False)
+    sl_hit_time     = Column(DateTime)
+
+    # Excursion (ATR units)
+    mfe_atr         = Column(Float, default=0.0)
+    mae_atr         = Column(Float, default=0.0)
+
+    # Exit state
+    status          = Column(String(10), default="OPEN")   # OPEN / CLOSED
+    exit_time       = Column(DateTime)
+    exit_price      = Column(Float, default=0.0)           # option LTP at close
+    exit_spot       = Column(Float, default=0.0)
+    exit_reason     = Column(String(20), default="")       # SL_HIT/T2_HIT/T3_HIT/EOD
+    outcome         = Column(String(10), default="")       # WIN / LOSS / NEUTRAL
+
+    # Realized P&L in rupees (2 lots, actual exit price used)
+    realized_pnl    = Column(Float, default=0.0)
+
+    created_at      = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_s11_index_date",  "index_name", "date"),
+        Index("idx_s11_status",      "status"),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# 10. OPTION EOD PRICES
+# Live option strike prices collected every tick till market close.
+# Stores ATM ± N strikes per chain update for research.
+# Used for: option premium modelling, IV term structure, greeks research.
+# ──────────────────────────────────────────────────────────────────
+class OptionEODPrice(Base):
+    __tablename__ = "option_eod_prices"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+
+    # When and where
+    timestamp     = Column(DateTime,   nullable=False)
+    index_name    = Column(String(20), nullable=False)
+    expiry        = Column(String(15), nullable=False)   # "27MAR2025"
+    spot_price    = Column(Float, default=0.0)
+    atm_strike    = Column(Float, default=0.0)
+
+    # Strike-level data (one row per strike)
+    strike        = Column(Float, nullable=False)
+    strike_offset = Column(Integer, default=0)  # 0=ATM, +1=1 above ATM, -1=1 below, etc.
+
+    # Call option
+    call_ltp      = Column(Float, default=0.0)
+    call_oi       = Column(Float, default=0.0)
+    call_iv       = Column(Float, default=0.0)
+    call_volume   = Column(Float, default=0.0)
+
+    # Put option
+    put_ltp       = Column(Float, default=0.0)
+    put_oi        = Column(Float, default=0.0)
+    put_iv        = Column(Float, default=0.0)
+    put_volume    = Column(Float, default=0.0)
+
+    created_at    = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_eod_index_ts",     "index_name", "timestamp"),
+        Index("idx_eod_strike_ts",    "index_name", "strike", "timestamp"),
     )

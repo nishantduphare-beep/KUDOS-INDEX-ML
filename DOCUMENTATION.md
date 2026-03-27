@@ -1,1100 +1,833 @@
-# NiftyTrader Intelligence — Complete Documentation
+# NiftyTrader Intelligence System — Complete Guide
 
-> Version 3.0 | Multi-broker intraday signal engine for Indian equity indices
+> Version 3.1 | Updated: March 2026
+> Intraday Options Signal & ML Intelligence Platform for Indian Equity Indices
+> Status: **Production Ready**
 
 ---
 
 ## Table of Contents
 
-1. [Overview](#1-overview)
-2. [Architecture](#2-architecture)
-3. [Installation & Setup](#3-installation--setup)
-4. [Broker Authentication (Fyers)](#4-broker-authentication-fyers)
-5. [Signal Engines](#5-signal-engines)
-6. [Alert System](#6-alert-system)
-7. [UI Tabs Reference](#7-ui-tabs-reference)
-8. [Database Schema](#8-database-schema)
-9. [ML Pipeline](#9-ml-pipeline)
-10. [Configuration Reference](#10-configuration-reference)
-11. [Data Flow](#11-data-flow)
-12. [File Structure](#12-file-structure)
-13. [Outcome Tracking](#13-outcome-tracking)
-14. [Troubleshooting](#14-troubleshooting)
+1. [What is NiftyTrader?](#1-what-is-niftytrader)
+2. [What Does the System Do — Step by Step](#2-what-does-the-system-do)
+3. [Which Indices We Track](#3-which-indices-we-track)
+4. [The 8 Signal Engines](#4-the-8-signal-engines)
+5. [How a Trade Signal is Born](#5-how-a-trade-signal-is-born)
+6. [Options Strategy Logic](#6-options-strategy-logic)
+7. [Trade Management — Targets and Stop Loss](#7-trade-management)
+8. [P&L Tracking in Rupees](#8-pl-tracking-in-rupees)
+9. [Named Setup Performance System](#9-named-setup-performance-system)
+10. [Machine Learning Brain](#10-machine-learning-brain)
+11. [Auto Trading (Paper & Live)](#11-auto-trading)
+12. [Backtesting Results — What We Tested](#12-backtesting-results)
+13. [Best Combinations Found](#13-best-combinations-found)
+14. [Index-Wise Performance Report](#14-index-wise-performance-report)
+15. [How to Start the Application](#15-how-to-start-the-application)
+16. [Screen by Screen Guide](#16-screen-by-screen-guide)
+17. [Data Flow — How Everything Connects](#17-data-flow)
+18. [Expiry Calendar — How Dates Are Managed](#18-expiry-calendar)
+19. [Production Fixes Applied](#19-production-fixes-applied)
+20. [Glossary — Simple Definitions](#20-glossary)
 
 ---
 
-## 1. Overview
+## 1. What is NiftyTrader?
 
-**NiftyTrader Intelligence** is a real-time options trading signal engine for Indian equity indices (NIFTY, BANKNIFTY, MIDCPNIFTY, SENSEX). It runs 7 independent signal engines every 3-minute candle, aggregates their votes into confidence-scored alerts, and tracks trade outcomes to continuously improve via machine learning.
+NiftyTrader is an **automated market intelligence system** designed specifically for Indian stock market options trading.
 
-### What it does
+Think of it like this:
 
-| Capability | Detail |
-|---|---|
-| **Market coverage** | NIFTY, BANKNIFTY, MIDCPNIFTY, SENSEX |
-| **Signal timeframe** | 3-minute primary candles + 5-min / 15-min multi-timeframe validation |
-| **Alert types** | Early Move Alert (4+ engines) → Trade Signal (confirmed on candle close) |
-| **Brokers supported** | Fyers (primary), Dhan, Kite, Upstox, Mock (demo) |
-| **Alert channels** | In-app UI, desktop popup, sound beep, Telegram |
-| **ML scoring** | RandomForest/XGBoost model trained on historical outcomes; probability score augments every alert |
-| **Outcome tracking** | Automated SL/T1/T2/T3 level hit detection, MFE/MAE, post-close analysis |
+> Imagine you had 8 expert analysts watching the market simultaneously — one watches price momentum, one watches volume, one watches options data, one watches market trend, and so on. Each analyst calls out when they see something interesting. When **4 or more analysts agree at the same time**, the system raises an alert. When additional quality filters pass, it suggests a trade.
 
-### Signal philosophy
+That is exactly what NiftyTrader does — automatically, in real time, every 3 minutes during market hours.
 
-- **7 triggering engines** vote on direction — no single indicator can fire a signal
-- **2 data-only engines** (Option Chain, IV Expansion) still run every tick but feed ML only
-- **4-engine threshold** for Early Move Alert (heads-up, high noise tolerance)
-- **Candle-close confirmation** — Trade Signal waits for the next candle open before firing
-- **Multi-timeframe blocking** — if 5-min AND 15-min both oppose the 3-min signal, Trade Signal is suppressed
-- **Quality gates** — ADX ≥ 20, |DI spread| ≥ 5, volume ≥ 0.8× avg, PCR ≥ 0.7, MTF STRONG required
+### What it is NOT
+- It is not a guaranteed profit system
+- It does not place real orders by default (auto-trade is OFF by default)
+- It is a **decision support and signal intelligence tool** that gives you high-quality, filtered trade setups
 
----
-
-## 2. Architecture
-
-### Layer diagram
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Broker API  (Fyers / Dhan / Kite / Upstox / Mock)              │
-│  REST + WebSocket                                               │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ OHLCV, OI, Option Chain
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  DataManager  (data/data_manager.py)                            │
-│  ├─ IndexState per index (spot, candles, futures, option chain) │
-│  ├─ 5s tick thread — fetch spot + candle + OI                  │
-│  ├─ Candle-close thread — detect 3-min boundary                │
-│  └─ Indicator computation — ATR, DI, ADX, Volume SMA           │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ pandas DataFrames (df, df_5m, df_15m, futures_df)
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  SignalAggregator  (engines/signal_aggregator.py)               │
-│  ├─ Engine 1: Compression       ├─ Engine 5: Liquidity Trap    │
-│  ├─ Engine 2: DI Momentum       ├─ Engine 6: Gamma Levels      │
-│  ├─ Engine 3: Volume Pressure   ├─ Engine 7: VWAP Pressure     │
-│  ├─ Engine 4: Market Regime     └─ (+ 2 data-only: OC, IV)    │
-│  └─ MTF Alignment (confidence modifier, not gate)              │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ EarlyMoveAlert / TradeSignal
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  AlertManager  (alerts/alert_manager.py)                        │
-│  ├─ UI callback → Alerts Tab                                    │
-│  ├─ Sound beep (1 / 3 beeps)                                   │
-│  ├─ Desktop popup (plyer)                                       │
-│  └─ Telegram (optional)                                        │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-          ┌────────────────┼──────────────────────┐
-          ▼                ▼                      ▼
-┌──────────────┐  ┌───────────────┐   ┌───────────────────────┐
-│  UI (PySide6)│  │  OutcomeTrack │   │  ML Pipeline          │
-│  6 tabs      │  │  SL/T1/T2/T3  │   │  Feature Store (79+)  │
-│              │  │  MFE/MAE      │   │  AutoLabeler (15 min) │
-│              │  │  Post-close   │   │  RF/XGBoost model     │
-└──────────────┘  └───────┬───────┘   └──────────┬────────────┘
-                          │                       │
-                          └──────────┬────────────┘
-                                     ▼
-                          ┌──────────────────────┐
-                          │  SQLite Database      │
-                          │  6 tables             │
-                          └──────────────────────┘
-```
-
-### Key design patterns
-
-| Pattern | Where used | Why |
-|---|---|---|
-| **Adapter** | `data/adapters/` | Swap brokers without changing engine logic |
-| **Observer** | DataManager → SignalAggregator callbacks | Decouple data fetch from signal logic |
-| **Repository** | `database/manager.py` | Clean separation of storage from business logic |
-| **State Machine** | `OutcomeTracker` | OPEN → CLOSED → POST-CLOSE with clear transitions |
-| **Thread Safety** | `threading.Lock` on IndexState, SignalAggregator, OutcomeTracker | Prevent race conditions in 5s tick loop |
+### Key Numbers at a Glance
+| Feature | Detail |
+|---------|--------|
+| Indices covered | NIFTY, BANKNIFTY, MIDCPNIFTY, SENSEX |
+| Signal scan frequency | Every 3 minutes |
+| Triggering signal engines | 6 (Compression, DI, Volume, Liquidity Trap, Gamma, Market Regime) |
+| Data-only engines | 2 (Option Chain, IV Expansion) — feed ML only |
+| MTF modifier | 1 (Multi-Timeframe Alignment — adjusts confidence score, not a gate) |
+| ML features tracked | 93 parameters per signal |
+| Named setups | 23 (graded A++ to D based on live data) |
+| Tested win rate (best setup) | 67–83% (DI + Trending + High Volume) |
+| Average signals per day | 5–25 per index (depending on filter) |
+| P&L tracking | Real rupees, per lot, per trade |
 
 ---
 
-## 3. Installation & Setup
-
-### Requirements
+## 2. What Does the System Do — Step by Step
 
 ```
-Python 3.10+
-PySide6
-pandas, numpy
-sqlalchemy
-xgboost
-fyers-apiv3
-plyer          (desktop notifications)
+LIVE MARKET DATA
+     |
+     v
+[Fyers Broker Connection]
+  - Index spot prices (NIFTY, BANKNIFTY, MIDCPNIFTY, SENSEX)
+  - Options chain data (all strikes, expiry dates — live from broker)
+  - PCR, OI, IV, Max Pain
+  - Futures OI and basis (for institutional footprint ML features)
+  - VIX (India volatility index)
+     |
+     v
+[6 TRIGGERING ENGINES + 2 DATA-ONLY run every 3 minutes]
+  Each engine checks a different market condition
+  Each triggering engine votes YES or NO
+  Data-only engines (Option Chain, IV Expansion) save features without voting
+     |
+     v
+[SIGNAL AGGREGATOR]
+  Counts how many triggering engines voted YES
+  If 4 or more → EARLY MOVE ALERT
+  If all quality gates pass → TRADE SIGNAL
+  If candle closes with signal intact → CONFIRMED SIGNAL
+     |
+     v
+[ALERT SYSTEM]
+  Sends alert to UI dashboard + Sound + Telegram
+  Shows: Index, Direction (Buy/Sell), Entry price,
+         Stop Loss, Target 1/2/3, Lot Size, Investment, Confidence score
+     |
+     v
+[ML FEATURE RECORDER + SETUP SCREENER]
+  Saves all 93 ML parameters to database
+  Evaluates all 23 named setups — saves which ones fired
+  Auto-labeler grades outcomes later (T1/T2/T3/SL)
+     |
+     v
+[TRADE OUTCOME TRACKER]
+  Monitors if option premium hits T1, T2, T3 or Stop Loss
+  Records realized P&L in rupees (lot_size × premium move)
+  Stores result for ML training and setup statistics
+     |
+     v
+[ML MODEL TRAINING]
+  Learns which combinations of 93 features
+  produced wins vs losses
+  Gets smarter over time
 ```
 
-### First run
+---
 
-```bash
-cd nifty_trader
-pip install -r requirements.txt
+## 3. Which Indices We Track
+
+| Index | Exchange | Lot Size | Options Type | Expiry (Current Rules — Sep 2025+) |
+|-------|----------|----------|--------------|-------------------------------------|
+| **NIFTY** | NSE | 50 | Weekly | Every **Tuesday** |
+| **BANKNIFTY** | NSE | 15 | Monthly | Last **Tuesday** of month |
+| **MIDCPNIFTY** | NSE | 75 | Monthly | Last **Tuesday** of month |
+| **SENSEX** | BSE | 10 | Weekly | Every **Thursday** |
+
+> **Note on SEBI Rule Changes:**
+> SEBI changed options expiry rules twice:
+> - **Before Nov 20, 2024:** All indices had weekly options (NIFTY=Thu, BANKNIFTY=Thu, MIDCPNIFTY=Mon, SENSEX=Fri)
+> - **Nov 20, 2024 → Aug 31, 2025:** NIFTY=Weekly Thu, BANKNIFTY=Monthly last-Thu, MIDCPNIFTY=Monthly last-Mon, SENSEX=Weekly Fri
+> - **Sep 1, 2025 onwards (current):** NIFTY=Weekly Tue, BANKNIFTY=Monthly last-Tue, MIDCPNIFTY=Monthly last-Tue, SENSEX=Weekly Thu
+>
+> The system handles all these date changes automatically. **Live expiry dates are always fetched from the broker (Fyers expiryData) on every option chain refresh.** Hardcoded weekday math is only used as a fallback before the broker connects for the first time.
+
+---
+
+## 4. The 8 Signal Engines
+
+Each engine is an independent detector. The first 6 are **triggering engines** — they vote toward the alert threshold. The last 2 are **data-only** — they save ML features but do not vote.
+
+---
+
+### Engine 1 — Compression Detector
+**What it watches:** How quiet the market has become before a move
+
+**Simple explanation:**
+When prices move in a very tight range for several candles (market is "compressed"), energy is building for a big move. This engine detects when the recent candle range is less than 70% of the normal range.
+
+**Technical detail:**
+- Compares last 5-candle average range vs last 20-candle average range
+- Fires when `5-candle range / 20-candle range < 0.7`
+- ATR (Average True Range) used as the baseline
+
+---
+
+### Engine 2 — DI Momentum Detector
+**What it watches:** Directional strength of the trend
+
+**Simple explanation:**
+Two forces are always competing — bulls (buyers) and bears (sellers). The Directional Indicator (DI) measures which side is stronger and how fast that strength is building.
+
+**Technical detail:**
+- Uses Wilder's +DI (bullish force) and -DI (bearish force)
+- ADX measures overall trend strength (not direction)
+- Fires when `ADX > 20` AND `|+DI − -DI| > 5`
+- Tracks DI slope (rate of change) across 3m, 5m, 15m timeframes
+
+---
+
+### Engine 3 — Volume Pressure Detector
+**What it watches:** Unusual buying or selling volume
+
+**Simple explanation:**
+When volume suddenly spikes above normal, big players are entering the market — and price usually follows their direction.
+
+**Technical detail:**
+- Compares current volume vs 20-bar average (`volume_ratio`)
+- Also checks last 5-bar average for short-term spikes
+- Fires when `volume_ratio > 1.5` (50% above normal)
+
+---
+
+### Engine 4 — Liquidity Trap Detector
+**What it watches:** Stop-loss hunting moves
+
+**Simple explanation:**
+Large institutional traders sometimes push price to where many retail traders have their stop-losses, triggering a cascade. After sweeping these stops, price reverses sharply. This engine detects those "trap" candles.
+
+**Technical detail:**
+- Looks for candles with long wicks (wick > 60% of total candle range)
+- Combined with high volume = stop hunt signature
+- `sweep_up` flag for bullish traps, `sweep_down` for bearish traps
+
+---
+
+### Engine 5 — Gamma Level Detector
+**What it watches:** Key price levels where options activity clusters
+
+**Simple explanation:**
+Options market makers hedge at round numbers (like 22000, 22200 for NIFTY). These act like walls — price bounces off them or breaks through with force.
+
+**Technical detail:**
+- Calculates distance to nearest significant OI strike level
+- Tracks Call Wall (largest call OI) and Put Wall (largest put OI)
+- Fires when price is within 0.3% of a gamma level, or breaks through one
+
+---
+
+### Engine 6 — Market Regime Detector
+**What it watches:** Whether the market is trending or ranging
+
+**Simple explanation:**
+Sometimes the market moves in a clear direction (trending). Other times it moves up and down without going anywhere (ranging/choppy). Trading in a trending market is far more profitable. This engine tells you which mode the market is in.
+
+**Technical detail:**
+- Choppiness Index: below 61.8 = trending, above 61.8 = choppy
+- ADX > 25 = strong trend present
+- ATR ratio: current ATR vs 20-bar average ATR
+- Fires only when all three agree: `TRENDING` regime
+- **Single most powerful filter in the system** (see results section)
+
+---
+
+### Data-Only: Option Chain Analyzer
+**What it watches:** What big money is doing in the options market
+
+**Why data-only:** OI data lags price. As a triggering engine it gave only 27% win rate — ML handles it better. All option chain data (PCR, OI change, IV rank, Max Pain) is still saved as ML features.
+
+---
+
+### Data-Only: IV Expansion Detector
+**What it watches:** Whether implied volatility is expanding or contracting
+
+**Why data-only:** IV rises *after* big candles, not before — it is a lagging confirmation. Saved as ML features (`avg_atm_iv`, `iv_skew_ratio`, `iv_change_pct`).
+
+---
+
+### MTF Alignment (Score Modifier — not a gate)
+**What it watches:** Whether the 5-minute and 15-minute timeframes agree with the 3-minute signal
+
+Adjusts the confidence score up or down. When set to STRONG mode, signals are blocked if 5m and 15m both oppose the direction. Does NOT count toward the engine threshold.
+
+---
+
+## 5. How a Trade Signal is Born
+
+```
+Every 3 minutes, all 6 triggering engines check the latest candle:
+
+Engine 1 (Compression):   YES (energy building)
+Engine 2 (DI Momentum):   YES (bulls leading)
+Engine 3 (Volume):        NO  (normal volume)
+Engine 4 (Liq Trap):      NO
+Engine 5 (Gamma):         NO
+Engine 6 (Regime):        YES (TRENDING confirmed)
+                          ---
+engines_count = 3  ← below threshold of 4 → no signal
+
+OR:
+Engine 1 (Compression):   YES
+Engine 2 (DI Momentum):   YES
+Engine 3 (Volume):        YES
+Engine 4 (Liq Trap):      NO
+Engine 5 (Gamma):         YES
+Engine 6 (Regime):        YES
+                          ---
+engines_count = 5  ← EARLY MOVE ALERT fires
+
+Then additional quality gates for TRADE SIGNAL:
+  ✓ Candle > 33% complete (forming-candle guard)
+  ✓ MTF alignment: STRONG (5m + 15m agree)
+  ✓ ADX ≥ 20 on 3m candle
+  ✓ |DI spread| ≥ 5 in signal direction
+  ✓ Volume ratio ≥ 1.5 (or range expansion OR volume engine triggered)
+  ✓ PCR ≥ 0.7
+  ✓ ML probability ≥ 0.45 (if model is trained)
+  ✓ No active event window (RBI/Fed/Budget)
+  ✓ VIX within acceptable range (if gate enabled)
+  ✓ Not in cooldown from prior signal (1 candle per direction)
+  → TRADE SIGNAL fires
+```
+
+### Signal Quality Levels
+| engines_count | Quality | Win Rate (tested) |
+|---------------|---------|-------------------|
+| 2 engines | Baseline | ~12.8% (base) |
+| 3 engines | Normal | ~19% |
+| 4 engines | Good | ~40% |
+| 4 + Trending Regime | Strong | **~57%** |
+| 4 + Trending + High Volume | Premium | **~67%** |
+| NIFTY only, all filters | Elite | **~83%** |
+
+---
+
+## 6. Options Strategy Logic
+
+When a signal fires, the system recommends an options trade using the live option chain from the broker.
+
+### Strike Selection
+- **Normal confidence:** ATM strike (delta ≈ 0.50)
+- **High confidence** (above threshold): 1-strike ITM (delta ≈ 0.62 — better delta, lower theta risk)
+- **Liquidity guard:** If ITM strike has OI below minimum threshold, falls back to ATM
+- **Expiry day rollover:** If DTE ≤ threshold, automatically uses next week's expiry
+
+### For a BULLISH Signal (Buy CE — Call Option)
+```
+Index: NIFTY at 22,350  |  ATR: 31 points  |  delta: 0.50
+ATM Strike: 22,350 CE
+Entry: Current CE premium (e.g., 85.0)
+SL:    85.0 − (31 × 0.50 × 0.8) = 85.0 − 12.4 = 72.5
+T1:    85.0 + (31 × 0.50 × 1.0) = 85.0 + 15.5 = 100.5
+T2:    85.0 + (31 × 0.50 × 1.5) = 85.0 + 23.3 = 108.5
+T3:    85.0 + (31 × 0.50 × 2.2) = 85.0 + 34.1 = 119.0
+```
+
+### Target Points Per Index (Typical)
+| Index | ATR avg | Stop Loss | Target 1 | Target 2 | Target 3 |
+|-------|---------|-----------|----------|----------|----------|
+| NIFTY | 31 pts | −12.5 | +15.5 | +23.3 | +34.1 |
+| BANKNIFTY | 87 pts | −35 | +43.5 | +65.3 | +95.7 |
+| MIDCPNIFTY | 20 pts | −8 | +10 | +15 | +22 |
+| SENSEX | 101 pts | −40.4 | +50.5 | +75.8 | +111 |
+
+---
+
+## 7. Trade Management
+
+### Exit Strategy (Actual Implementation)
+```
+T1 hit → Milestone recorded, position remains open
+T2 hit → 50% position booked at T2 premium; SL trails to entry (cost)
+T3 hit → Remaining 50% booked at T3 premium
+SL hit before T2 → 100% loss at SL premium
+SL hit after T2 (at cost) → 50% profit at T2, 0% on remaining
+EOD (3:30 PM) → All open positions closed at current premium
+```
+
+### Label Quality System
+Every trade outcome is graded:
+| Grade | Meaning | label_quality value |
+|-------|---------|---------------------|
+| SL Hit | Stop loss triggered | 0 |
+| T1 Hit | First target reached | 1 |
+| T2 Hit | Second target reached | 2 |
+| T3 Hit | Third target reached | 3 |
+
+---
+
+## 8. P&L Tracking in Rupees
+
+The system tracks real rupee P&L for every trade signal, not just points.
+
+### How P&L is Calculated
+
+```
+At signal time (registration):
+  lot_size        = from SYMBOL_MAP (NIFTY=50, BANKNIFTY=15, MIDCPNIFTY=75, SENSEX=10)
+  investment_amt  = entry_premium × lot_size
+  pnl_sl          = (stop_loss_premium − entry_premium) × lot_size
+  pnl_t1          = (t1_premium − entry_premium) × lot_size
+  pnl_t2          = (t2_premium − entry_premium) × lot_size
+  pnl_t3          = (t3_premium − entry_premium) × lot_size
+
+At close:
+  T3 hit  → realized = (T2 − entry) × lot × 50% + (T3 − entry) × lot × 50%
+  T2 hit  → realized = (T2 − entry) × lot × 50% + 0 (rest closed at cost)
+  SL hit  → realized = (SL − entry) × lot × 100%
+  EOD     → realized = (exit_premium − entry) × lot × 100%
+```
+
+### Example (NIFTY CE)
+```
+Entry: 85.0  |  Lot size: 50  |  Investment: ₹4,250
+T2 hit at 108.5 → realized = (108.5 − 85.0) × 50 × 0.5 = ₹587.50
+SL then hit (at cost 85.0) → remaining 50% = ₹0
+Total realized: ₹587.50 on ₹4,250 invested = +13.8% return
+```
+
+### Where P&L is Stored
+- `trade_outcomes` table: `lot_size`, `investment_amt`, `pnl_sl`, `pnl_t1`, `pnl_t2`, `pnl_t3`, `realized_pnl`
+- `setup_alerts` table: `realized_pnl` — propagated from the trade outcome linked to each setup
+- Aggregated per setup in the **Setup Performance** tab
+- Shown in **HQ Trades** tab detail panel
+
+---
+
+## 9. Named Setup Performance System
+
+The system tracks 23 named trading setups. Each setup is a specific filter condition on signal features, graded from backtesting and live data.
+
+### Setup Grades
+| Grade | Win Rate Threshold | Color |
+|-------|--------------------|-------|
+| A++ | ≥ 83% | Gold |
+| A+ | ≥ 67% | Green |
+| A | ≥ 56% | Green |
+| A- | ≥ 45% | Light green |
+| B | ≥ 35% | Amber |
+| C- | < 35% | Grey |
+| D | < 20% | Dark grey |
+
+### How Setup Matching Works
+When a signal fires, the SetupScreener evaluates all 23 setups in one pass. A setup "fires" when:
+1. Its condition (lambda over signal features) returns True
+2. Its index_filter matches (or is empty = all indices)
+3. Its direction_filter matches (or is empty = both directions)
+
+Results are saved to the `setup_alerts` table — one row per fired setup per signal. As trades close and outcomes are labeled, realized P&L propagates back to each setup's row.
+
+### Setup Performance Tab
+The **Setups** tab in the UI shows for each named setup:
+- **GRADE** — A++ to D
+- **EXP WR%** — Expected win rate from backtesting
+- **ACT WR%** — Actual live win rate (color: green ≥ expected, amber close, red far below)
+- **TOTAL / WINS** — Trade counts
+- **T2 HITS / T3 HITS** — Premium outcome counts
+- **AVG QUAL** — Average label quality (0=SL, 1=T1, 2=T2, 3=T3)
+- **AVG P&L ₹** — Average realized rupee P&L per trade
+- **TOTAL P&L ₹** — Cumulative realized rupee P&L
+- Auto-refreshes every 30 seconds
+
+---
+
+## 10. Machine Learning Brain
+
+### What it Learns
+The ML system records 93 parameters for every signal and tracks outcomes. Over time it learns:
+- Which combinations of features produce wins vs losses
+- Which market conditions to avoid
+- Which indices work in which regimes
+- Bull vs bear performance differences per index
+
+### 93 Features Tracked
+
+| Category | Examples | Count |
+|----------|---------|-------|
+| Price momentum | ATR, compression ratio, candle range | 6 |
+| DI / Directional | +DI, -DI, DI spread, DI slope (3m/5m/15m) | 12 |
+| Volume | Volume ratio vs 5-bar and 20-bar avg, stealth pattern | 4 |
+| VWAP | Distance to VWAP, cross, bounce, rejection, vol ratio | 7 |
+| Options chain | PCR, OI change, IV rank (avg_call_iv), Max Pain distance | 6 |
+| IV Expansion | avg_atm_iv, iv_skew_ratio, iv_change_pct, iv_expanding | 4 |
+| Market structure | 5m and 15m swing structure (HH/HL vs LH/LL) | 5 |
+| Market regime | Choppiness, ADX, ATR ratio, regime label, regime_adx | 5 |
+| Time context | Session, DTE, is_expiry, day_of_week, mins_since_open | 6 |
+| MTF DI slopes | plus/minus_di_slope_5m/15m, reversal flags | 10 |
+| Multi-index | How many indices agree on direction, market breadth | 3 |
+| Futures / OI | Futures OI, OI change %, basis slope, excess basis, OI regime | 9 |
+| VIX | vix value, vix_high flag | 2 |
+| Pre-open | Pre-open futures gap % (frozen at 9:15) | 1 |
+| Signal identity | direction_encoded, index_encoded, engines_count, is_trade_signal | 4 |
+| Candle patterns | prev_body_ratio, consec_bull/bear, range_expansion, prev_bullish | 4 |
+| Engine triggers | compression/di/volume/liq/gamma/vwap/iv/oc triggered flags | 8 |
+
+### Feature Key Collision Protection
+Every feature is stored with an explicit column name (not from a generic dict flatten). Known naming conflicts between engines are explicitly disambiguated:
+- `iv_rank` → sourced from **option_chain engine only** (= avg_call_iv)
+- `volume_ratio` → sourced from **volume_pressure engine only**
+- `adx` → sourced from **di_momentum engine only** (regime uses `regime_adx`)
+
+### Three Training Phases
+| Phase | Condition | Behavior |
+|-------|-----------|----------|
+| 1 | < MIN_SAMPLES_TO_TRAIN labeled records | No ML gate. Strategy-only signals. |
+| 2 | First model trained | ML score shown. Signals gated at probability ≥ 0.45. |
+| 3 | Every RETRAIN_INTERVAL new samples | Auto-retrain in background. Model improves continuously. |
+
+---
+
+## 11. Auto Trading
+
+The system supports three operating modes:
+
+| Mode | Description |
+|------|-------------|
+| **OFF** | No orders placed. Dashboard only. (Default) |
+| **PAPER** | Simulated orders. P&L computed from live OutcomeTracker data. No real money. |
+| **LIVE** | Real Fyers bracket orders placed at the exchange. |
+
+### Quality Gates (All Must Pass Before Any Order)
+- Mode is PAPER or LIVE
+- Daily order cap not reached
+- Signal confidence ≥ `AUTO_TRADE_MIN_CONFIDENCE`
+- Engines count ≥ `AUTO_TRADE_MIN_ENGINES`
+- Not already placed for this alert_id (dedup guard)
+
+### Bracket Order Logic (LIVE mode)
+Fyers bracket orders bundle entry + SL + target in one exchange-level order. The system:
+1. Builds the Fyers option symbol (e.g., `NSE:NIFTY25APR23300CE`)
+2. Calculates SL and TP as *offsets from fill price* (ATR-based)
+3. Uses live option LTP at candle-close as entry (not the stale signal price)
+4. Position size: `lot_size × recommended_lots × AUTO_TRADE_LOT_MULTIPLIER`
+
+---
+
+## 12. Backtesting Results — What We Tested
+
+### How We Tested
+We fetched 180 days of historical price data (3-minute, 5-minute, 15-minute candles) for all 4 indices from Fyers and ran the exact same signal engines on this data.
+
+**Important limitation:** Historical testing used only price-based features. Option chain features (PCR, OI, IV) were set to zero since we cannot replay the live options market. Results from live 6-day data (which includes real option chain data) are more accurate.
+
+### Base Statistics
+| Metric | Value |
+|--------|-------|
+| Total records tested | 4,008 (6-day live labeled) |
+| Base win rate (no filter) | **12.8%** |
+| Date range | March 17–24, 2026 |
+| Market condition | Bearish trending market |
+
+---
+
+## 13. Best Combinations Found
+
+### Ranked by Win Rate
+
+| # | Combination | Win Rate | Trades/day | Lift |
+|---|-------------|----------|-----------|------|
+| 1 | DI aligned + Trending + High Volume | **67.2%** | ~5/index | 5.26× |
+| 2 | DI aligned + Trending | **56.6%** | ~18 total | 4.43× |
+| 3 | Option Chain triggered + DI aligned | **56.3%** | ~8 total | 4.41× |
+| 4 | Trending Regime alone | **55.8%** | ~20 total | 4.37× |
+| 5 | Option Chain triggered alone | **53.3%** | ~10 total | 4.17× |
+| 6 | DI aligned + 4 engines | **40.1%** | ~29 total | 3.14× |
+| 7 | DI aligned + 3 engines | 19.2% | ~78 total | 1.51× |
+| 8 | DI aligned alone | 12.0% | ~164 total | 0.94× |
+
+### What Does NOT Work (Avoid These)
+| Combination | Win Rate | Why it fails |
+|-------------|----------|-------------|
+| VWAP signals alone | **1.7%** | Fires at reversals, not trend direction |
+| Structure alone (5m+15m) | **8.2%** | Too lagging |
+| Raw ADX threshold | **11–14%** | Too broad, no real filtering |
+| DI aligned alone | **12.0%** | Needs regime confirmation |
+
+### PCR Confirmation (When Available)
+| PCR Filter | Win Rate |
+|-----------|---------|
+| PCR > 1.2 (bearish) + DI + Trending | **60.1%** |
+| PCR > 1.2 + Trending | 58.2% |
+| PCR < 0.8 (bullish) | 27.0% *(limited data)* |
+
+---
+
+## 14. Index-Wise Performance Report
+
+### NIFTY
+| Filter | Win Rate | Trades/day |
+|--------|---------|-----------|
+| DI + Trending | **62.1%** | 24 |
+| DI + Trending + High Volume | **83.3%** | 6 |
+| Bull signals | 59.4% | 11/day |
+| Bear signals | 64.5% | 13/day |
+| **Recommendation** | Take both bull and bear signals | Best balanced index |
+
+### BANKNIFTY
+| Filter | Win Rate | Trades/day |
+|--------|---------|-----------|
+| DI + Trending | 55.6% | 10 |
+| Bear signals only | **71.1%** | 6/day |
+| Bull signals | 21–32% | Avoid |
+| OC + DI + Trending (bear) | **76.7%** | 5/day |
+| **Recommendation** | Bear trades only — skip all bull signals |
+
+### MIDCPNIFTY
+| Filter | Win Rate | Trades/day |
+|--------|---------|-----------|
+| DI + Trending | **56.6%** | 21 |
+| Bull signals | 54.9% | 8/day |
+| Bear signals | 57.7% | 13/day |
+| **Recommendation** | Both directions work, good signal volume |
+
+### SENSEX
+| Filter | Win Rate | Trades/day |
+|--------|---------|-----------|
+| DI + Trending | 48.9% | 15 |
+| Bull signals | 41.2% | Weak |
+| Bear signals | **58.5%** | 7/day |
+| **Recommendation** | Prefer bear signals; bull signals below 50% |
+
+---
+
+## 15. How to Start the Application
+
+### Method 1 — Batch File (Easiest)
+1. Go to `D:\nifty_trader_v3_final\`
+2. Double-click `Start NiftyTrader.bat`
+3. The application window opens automatically
+
+### Method 2 — Command Line
+```
+cd D:\nifty_trader_v3_final\nifty_trader
 python main.py
 ```
 
-The app will open with the **Credentials** tab active. Select your broker and authenticate.
+### First Time Setup
+1. On the **Credentials** tab, enter your Fyers Client ID and Secret
+2. Click **Connect**
+3. A browser window opens — log in to Fyers and approve access
+4. The app reconnects automatically with live data
+5. Green status bar at bottom = connected and scanning
 
-### Mock mode (no broker needed)
+### Important
+- App starts in **Mock Mode** if Fyers is not connected — simulated data for testing
+- Live mode requires a valid Fyers API token (auto-refreshes daily via OAuth)
+- Market data is only live between 9:15 AM and 3:30 PM IST on trading days
+- Pre-open window (9:00–9:14 IST): futures LTP captured for gap feature, locked at 9:15
 
-Set `BROKER=mock` in environment or select **Mock** in the Credentials tab. The mock adapter generates synthetic OHLCV using geometric Brownian motion — useful for testing the UI and signal logic.
+---
 
-### Directory structure created on first run
+## 16. Screen by Screen Guide
+
+### Dashboard Tab (Tab 1)
+The main screen. Shows:
+- **Live index prices** for all 4 indices with prev-close comparison
+- **Engine status cards** per index (which engines are active)
+- **Active alerts** with direction, entry, SL, targets
+- **Signal confidence** (how many engines fired, confidence score)
+
+### Alerts Tab (Tab 2 — Scanner)
+Complete history of all signals generated:
+- Filter by index, date, direction
+- Color coded: green = win, red = loss, grey = pending
+- Click any alert to see full detail card including ML score and setup hits
+
+### HQ Trades Tab (Tab 3)
+Shows trade outcomes with full P&L breakdown:
+- Open trades being tracked (live monitoring)
+- Closed trades with realized P&L in rupees
+- Detail panel shows: Lot Size, Investment, P&L at each level (SL/T1/T2/T3)
+- Daily stats: win rate, total P&L, counts — filtered to TRADE_SIGNAL type only (not double-counted with CONFIRMED signals)
+
+### Setup Performance Tab (Tab 4 — Setups)
+Shows win statistics for all 23 named setups:
+- Grade, expected vs actual win rate, T2/T3 hit counts
+- Average P&L per trade in rupees
+- Total P&L across all trades for each setup
+- Summary bar: total setups, best setup, A++ win rate, cumulative P&L
+- Auto-refreshes every 30 seconds
+
+### ML Intelligence Tab (Tab 5)
+Shows what the ML brain has learned:
+- Win rate by feature, by index, by regime
+- Feature importance ranking
+- Model version, training samples used, accuracy metrics
+- Force retrain button
+
+### Setup Tab (Tab 6)
+Configure:
+- Which indices to scan
+- Minimum engines required (default: 4)
+- Alert sound and notification preferences
+- Auto-trade mode (OFF/PAPER/LIVE)
+
+### Credentials Tab (Tab 7)
+- Broker authentication (Fyers OAuth flow)
+- Hot-swap broker without restarting the app
+
+---
+
+## 17. Data Flow
 
 ```
-auth/
-  fyers_token.json          — Fyers access token (midnight IST expiry)
-logs/
-  niftytrader_YYYYMMDD.log  — daily log file
-models/
-  xgb_signal_v1.json        — trained XGBoost model (created after 100+ alerts)
-nifty_trader.db             — SQLite database
-user_settings.json          — sensitivity slider persistence
-```
-
----
-
-## 4. Broker Authentication (Fyers)
-
-Fyers uses OAuth2. The flow happens inside the **Credentials** tab.
-
-### Step-by-step
-
-1. Enter your **App ID** (e.g. `XB12345-100`) and **Secret Key**
-2. Click **Generate Auth URL** → browser opens Fyers login page
-3. Log in at Fyers and authorize the app
-4. Browser redirects to `https://trade.fyers.in/api-login/redirect-uri/index.html?auth_code=XXXX`
-5. Copy the `auth_code=XXXX` value from the URL
-6. Paste it into the **Auth Code** field in the app
-7. Click **Exchange Code** → token saved to `auth/fyers_token.json`
-
-### Token lifecycle
-
-- Valid until **midnight IST** on the same calendar day
-- On next launch: token auto-loaded if still valid (> 5 min remaining)
-- If expired: the Credentials tab shows "Token expired" — repeat steps 2–7
-
-### Alternative: Direct token paste
-
-If you already have an access token, use **Set Token Direct** to paste it without going through the full OAuth flow.
-
----
-
-## 5. Signal Engines
-
-Each engine evaluates the latest candle data and votes BULLISH, BEARISH, or NEUTRAL. A minimum of 2-out-of-3 internal sub-conditions must pass for most engines to trigger.
-
----
-
-### Engine 1 — Compression
-
-**What it detects:** Volatility coiling before an expansion move.
-
-| Sub-condition | Formula | Threshold |
-|---|---|---|
-| Range ratio | Recent 5-candle range ÷ 20-candle average range | < 0.70 |
-| ATR declining | Last 3 ATR values trending down | 2 of last 3 falling |
-| Volatility contraction | Close-price std (recent) ÷ close-price std (prior) | < 0.85 |
-
-**Direction:** Always NEUTRAL — compression itself has no direction. It becomes directional only when a breakout engine confirms.
-
-**Breakout check:** If close moves > 1×ATR beyond the compression range high/low, a breakout is flagged (used by the aggregator to gate Trade Signals).
-
----
-
-### Engine 2 — DI Momentum
-
-**What it detects:** Directional pressure before ADX confirms a crossover (leading indicator).
-
-| Sub-condition | Formula | Threshold |
-|---|---|---|
-| Primary DI trending | +DI rising (bullish) or -DI falling (bearish) over last 3 candles | Slope positive |
-| Secondary DI falling | Opposing DI declining | Slope negative |
-| Spread widening | +DI − -DI change | ≥ 2.0 points or ≥ 15% of current spread |
-
-**Direction:** BULLISH when +DI > -DI, BEARISH when -DI > +DI.
-
----
-
-### Engine 3 — Option Chain *(Data-Only — not a triggering engine)*
-
-**Status:** Runs every tick but does **not** count toward the 4-engine trigger threshold. Its data (PCR, max pain, OI change, iv_rank) is saved to the ML feature store for the model to learn from.
-
-**Why demoted:** OI data confirms moves that already happened. Historical data showed 27% WR when Option Chain was the deciding engine — below breakeven for options trading.
-
-**Data still collected for ML:**
-- PCR, max pain distance, call/put OI change
-- iv_rank, avg_atm_iv (used by IV Expansion engine below)
-
----
-
-### Engine 4 — Volume Pressure
-
-**What it detects:** Institutional accumulation or distribution via volume pattern.
-
-| Sub-condition | Formula | Threshold |
-|---|---|---|
-| Volume spike (mandatory) | Current volume ÷ SMA-20 volume | ≥ 1.5× |
-| Stealth/absorption | Small candle body on high volume (institutions absorbing) | Body < 50% of range on spike |
-| Volume trend up | Last 5 candles volume ratio rising | Positive slope |
-
-**Note:** The volume spike sub-condition is **mandatory** — the engine cannot trigger without it. However, for cash indices (NIFTY, BANKNIFTY, MIDCPNIFTY, SENSEX), Fyers returns near-zero spot volume. To work around this, the signal aggregator relaxes the gate to also accept `vol_triggered OR range_ok` for index signals.
-
----
-
-### Engine 5 — Liquidity Trap
-
-**What it detects:** Stop-hunt false breakout followed by reversal (wick rejection).
-
-| Sub-condition | Formula | Threshold |
-|---|---|---|
-| Sweep | Current candle high > prior 10-candle swing high (bearish trap) or low < swing low (bullish) | New extreme vs lookback |
-| Wick ratio | Wick length ÷ candle range | ≥ 0.50 (50%) |
-| Reversal confirmed | Close back inside the prior swing range | Close recaptured |
-
-**Direction:** BULLISH when a sweep of lows reverses upward; BEARISH when a sweep of highs reverses downward.
-
----
-
-### Engine 6 — Gamma Levels
-
-**What it detects:** Market-maker delta hedging walls (gamma support/resistance) and gamma flips.
-
-| Sub-condition | What it measures | Threshold |
-|---|---|---|
-| Near put wall | Spot price proximity to max put OI strike (support) | Within 0.2% of spot |
-| Near call wall | Spot price proximity to max call OI strike (resistance) | Within 0.2% of spot |
-| Gamma flip | Spot crossed the gamma wall since last snapshot | Direction of cross |
-
-**Direction:** BULLISH near put wall or bullish gamma flip; BEARISH near call wall or bearish gamma flip.
-
----
-
-### Engine 7 — VWAP Pressure *(new)*
-
-**What it detects:** Institutional anchor levels. VWAP (Volume Weighted Average Price) resets at 9:15 AM daily and is the single most-watched intraday level by institutional desks.
-
-| Setup | Condition | Direction |
-|---|---|---|
-| VWAP Bounce | Price near VWAP + bullish candle + volume ≥ 1.2× | BULLISH |
-| VWAP Reclaim | Price crosses above VWAP with strong body | BULLISH |
-| VWAP Rejection | Price near VWAP + bearish candle + volume ≥ 1.2× | BEARISH |
-| VWAP Cross Down | Price crosses below VWAP with volume | BEARISH |
-
-**VWAP band:** ±max(0.5×ATR, 0.3% of spot) — price must touch this band to count as a VWAP setup.
-
-**VWAP computation:** Calculated fresh each tick from today's session candles: `Σ(typical_price × volume) / Σ(volume)`.
-
----
-
-### Engine 7 (old) — IV Expansion *(Data-Only — not a triggering engine)*
-
-**Status:** Runs every tick but does **not** count toward the 4-engine trigger threshold.
-
-**Why demoted:** IV rises *because* a big candle already happened — it's a lagging confirmation, not a leading signal. Historical data showed 30% WR when IV Expansion was the deciding engine (fires in 86% of losing trades).
-
-**Data still collected for ML:** `iv_skew_ratio`, `avg_atm_iv`, `iv_change_pct`, `iv_rank`
-
----
-
-### Engine 8 — Market Regime
-
-**What it detects:** Market structure classification to prevent wrong-type signals.
-
-| Regime | Condition | Engine state |
-|---|---|---|
-| TRENDING | ADX > 25 AND Choppiness Index < 38.2 | Triggered → direction of dominant DI |
-| RANGING | Choppiness Index > 61.8 | **Not triggered** (abstains — avoids mean-reversion counter-trend) |
-| VOLATILE | ATR > 1.5× rolling ATR average | Triggered → recent momentum direction |
-
-**Choppiness Index formula:** `100 × log₁₀(ΣTR / (HH − LL)) / log₁₀(14)` over 14 candles.
-Responds in 1–2 candles vs ADX's 5–10 candle lag.
-
-**Key design:** The engine abstains (`is_triggered = False`) in RANGING markets specifically so it doesn't add votes against breakout logic. This allows breakouts from ranges to still generate signals.
-
----
-
-### MTF Alignment (confidence modifier)
-
-Not an engine — a score modifier applied after all 8 engines vote.
-
-| 5-min + 15-min bias vs signal direction | Score delta |
-|---|---|
-| Both agree with signal | +15 |
-| One agrees, one neutral | +7 |
-| Both neutral | 0 |
-| One opposes, one neutral | −7 |
-| Both oppose | −12 (and Trade Signal blocked) |
-
-**ADX threshold:** A timeframe bias is only called directional if ADX ≥ 15 on that timeframe. Below that, it's NEUTRAL.
-
----
-
-### Signal aggregation rules
-
-```
-Engines triggered  Action
-──────────────────────────────────────────────────────────────────
-< 4                No alert
-≥ 4                Early Move Alert fired
-                   (confidence = sum of engine scores / max_possible × 100%)
-
-≥ 4 + ALL gates    Trade Signal (pending)
-  Quality gates (ALL must pass):
-  ├─ Compression breakout confirmed (close > compression range ± ATR)
-  ├─ Volume ≥ 0.8× average (SIGNAL_MIN_VOLUME_RATIO)
-  ├─ PCR ≥ 0.7 (SIGNAL_MIN_PCR)
-  ├─ ADX ≥ 20 on 3m candle (TRADE_SIGNAL_MIN_ADX)
-  ├─ |DI spread| ≥ 5 in signal direction (TRADE_SIGNAL_MIN_DI_SPREAD)
-  ├─ MTF STRONG — both 5m+15m agree direction (TRADE_SIGNAL_REQUIRE_MTF_STRONG)
-  ├─ Candle ≥ 33% formed (not a brand-new candle)
-  └─ ML probability ≥ 0.45 if model is active (ML_SIGNAL_GATE_THRESHOLD)
-
-Next candle open → Trade Signal fires as CONFIRMED
-```
-
-**Path A (normal escalation):** Existing early alert in same direction + all quality gates pass.
-
-**Path B (quiet breakout):** No prior early alert, ≥ 10 minutes of silence, candle range > 1.5×ATR, DI triggered, engines ≥ 4.
-
-**Confidence score:** `(total triggered engine scores) / (sum of active engine weights) × 100`. Only the 7 triggering engines contribute — Option Chain and IV Expansion weights are excluded from the denominator.
-
----
-
-## 6. Alert System
-
-### Alert types
-
-| Type | Trigger | What it contains |
-|---|---|---|
-| `EARLY_MOVE` | ≥ 4 engines | Direction, confidence %, engines list, spot, PCR, ATR, ML score |
-| `TRADE_SIGNAL` | ≥ 5 engines + breakout + candle-close confirm | All of above + suggested instrument, entry ref, SL, T1/T2/T3 |
-
-### Instrument suggestion
-
-When a Trade Signal fires, the aggregator suggests an options instrument:
-
-- **Delta selection:** ATM (delta ≈ 0.50) when confidence < 65%; ITM (delta ≈ 0.60–0.65) when confidence ≥ 65%
-- **Expiry:** Current weekly expiry; rolls to next expiry if DTE ≤ 1 day
-- **Strike calculation:** ATM ± strike gap (NIFTY = 50, BANKNIFTY = 100, SENSEX = 100, MIDCPNIFTY = 25)
-
-### Target levels (spot-based)
-
-| Level | ATR multiplier |
-|---|---|
-| SL | entry ± 0.8 × ATR |
-| T1 | entry ± 1.0 × ATR |
-| T2 | entry ± 1.5 × ATR |
-| T3 | entry ± 2.2 × ATR |
-
-Direction determines sign: BULLISH adds for targets, subtracts for SL. BEARISH is reversed.
-
-### Alert throttling
-
-- **Early alerts:** 3-second minimum gap per direction per index (candle-interval throttle for DB writes; UI updated every tick)
-- **Trade signals:** One per 3-min candle per index
-- **MTF blocking:** If both 5-min and 15-min oppose the 3-min direction, Trade Signal is suppressed (Early Alert still fires)
-
-### Delivery channels
-
-| Channel | Early Move | Trade Signal | Confirmed |
-|---|---|---|---|
-| UI table update | ✓ | ✓ | ✓ |
-| Sound beep | 1 × 800 Hz | 3 × 1000 Hz | 2 × 1000 Hz |
-| Desktop popup | ✓ | ✓ | ✓ |
-| Telegram | ✓ (if enabled) | ✓ (if enabled) | ✓ (if enabled) |
-
----
-
-## 7. UI Tabs Reference
-
-### Tab 1 — Dashboard
-
-Real-time overview of all 4 indices.
-
-**Per-index card shows:**
-- Spot price + change + % change (vs previous close)
-- ATR (14-period, 3-min)
-- Volume ratio (current volume ÷ SMA-20)
-- Futures OI classification with color coding:
-
-| Classification | Condition | Color |
-|---|---|---|
-| ▲ LONG BUILDUP | Price ↑ + OI ↑ | Green |
-| ▲ SHORT COVERING | Price ↑ + OI ↓ | Blue |
-| ▼ SHORT BUILDUP | Price ↓ + OI ↑ | Red |
-| ▼ LONG UNWINDING | Price ↓ + OI ↓ | Orange |
-| ◆ NEUTRAL | No significant change | Gray |
-
-- Engine trigger count and confidence %
-- **INDEX FUTURES** panel with OI in Lakhs and 5/15/30-min OI change %
-
-### Tab 2 — Scanner
-
-Engine-by-engine live status for all indices.
-
-**Per-engine row shows:**
-- Engine name
-- Triggered (✓ green) or Not triggered (× gray)
-- Direction (BULLISH / BEARISH / NEUTRAL)
-- Strength % (0–100)
-- Score (0–25 contribution to confidence)
-- Brief reason text
-
-**Sensitivity slider:** Controls `MIN_ENGINES_FOR_SIGNAL` (3–6). Lower = more signals, higher = fewer but more selective. Setting persists across restarts in `user_settings.json`.
-
-### Tab 3 — Options Flow
-
-Future feature. Currently shows a placeholder.
-
-### Tab 4 — Alerts
-
-Main operational tab for monitoring and acting on signals.
-
-**Left panel — Alert history table:**
-
-| Column | Content |
-|---|---|
-| Time | HH:MM:SS |
-| Index | NIFTY / BANKNIFTY / MIDCPNIFTY / SENSEX |
-| Type | EARLY_MOVE / TRADE_SIGNAL |
-| Direction | BULLISH / BEARISH |
-| Confidence | 0–100% |
-| Engines | Count of triggered engines |
-| ML Score | Model probability (if available) |
-| Outcome | WIN / LOSS / NEUTRAL (filled by tracker) |
-
-Click any row to load full details in the right panel.
-
-**Right panel — Trade card:**
-- BUY/SELL action button
-- Suggested instrument (e.g., `NSE:NIFTY27MAR23000CE`)
-- Entry reference price, SL, T1, T2, T3
-- Lot size, suggested delta
-
-**Right panel — Details:**
-- Engine breakdown (which triggered, which didn't)
-- ML score with recommendation text
-- Market context (spot, ATR, PCR, VIX)
-- Outcome tracking (SL hit time, T1/T2/T3 hit times, MFE, MAE)
-
-**ML Status header:** Phase (collecting / active), sample count, model version, F1 score, retrain button.
-
-### Tab 5 — HQ Trades
-
-Detailed trade-level analytics table. One row per Trade Signal.
-
-| Column | Content |
-|---|---|
-| Alert ID | Unique alert reference |
-| Signal Time | When the Trade Signal fired |
-| Direction | BULLISH / BEARISH |
-| Confidence | Engine confidence % |
-| SL Hit | Time SL was hit (or — ) |
-| T1/T2/T3 Hit | Time each target was hit (or —) |
-| MFE | Maximum Favorable Excursion (in ATR units) |
-| MAE | Maximum Adverse Excursion (in ATR units) |
-| Exit Reason | SL / T3 / EOD |
-| Outcome | WIN / LOSS / NEUTRAL |
-
-### Tab 6 — Credentials
-
-Broker authentication and settings.
-
-- **Broker selector:** Dropdown (fyers, dhan, kite, upstox, mock)
-- **Credential fields:** App ID, Secret Key, Access Token (masked)
-- **Auth flow buttons:** Generate Auth URL, Exchange Code, Set Token Direct
-- **Connection status:** Connected / Disconnected / Token expiry countdown
-- **Save credentials** → persisted in `auth/credentials.json`
-
----
-
-## 8. Database Schema
-
-SQLite database at `nifty_trader.db`. Six tables.
-
----
-
-### Table: `market_candles`
-
-Stores all OHLCV candles (both spot and futures).
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | INTEGER PK | |
-| `index_name` | TEXT | NIFTY / BANKNIFTY / MIDCPNIFTY / SENSEX |
-| `timestamp` | DATETIME | Candle open time |
-| `interval` | INTEGER | Candle minutes (3, 5, 15) |
-| `open/high/low/close` | FLOAT | OHLC prices |
-| `volume` | FLOAT | |
-| `oi` | FLOAT | Open interest (futures only) |
-| `is_futures` | BOOLEAN | True for futures candles |
-| `candle_range` | FLOAT | high − low |
-| `body_size` | FLOAT | |abs(close − open)| |
-| `upper_wick/lower_wick` | FLOAT | Wick lengths |
-| `is_bullish` | BOOLEAN | close ≥ open |
-| `atr` | FLOAT | 14-period ATR at this candle |
-| `plus_di/minus_di/adx` | FLOAT | Directional indicators |
-| `volume_sma/volume_ratio` | FLOAT | Volume vs SMA-20 |
-| `created_at` | DATETIME | Row insert time |
-
----
-
-### Table: `option_chain_snapshots`
-
-Snapshots of the option chain, refreshed every 15 seconds during market hours.
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | INTEGER PK | |
-| `index_name` | TEXT | |
-| `timestamp` | DATETIME | Snapshot time |
-| `expiry_date` | TEXT | e.g. "27-Mar-2025" |
-| `spot_price` | FLOAT | |
-| `atm_strike` | FLOAT | Nearest strike to spot |
-| `total_call_oi/total_put_oi` | FLOAT | Sum across all strikes |
-| `pcr` | FLOAT | Put-Call Ratio (OI-based) |
-| `pcr_volume` | FLOAT | Put-Call Ratio (volume-based) |
-| `max_pain` | FLOAT | Max pain price |
-| `iv_rank` | FLOAT | IV rank (0–100) |
-| `call_oi_change/put_oi_change` | FLOAT | % change vs prior snapshot |
-| `pcr_change` | FLOAT | PCR delta vs prior |
-| `oi_signal` | TEXT | BULLISH / BEARISH / NEUTRAL |
-| `chain_data` | TEXT | Full JSON: [{strike, call_oi, put_oi, call_iv, put_iv, ...}] |
-| `created_at` | DATETIME | |
-
----
-
-### Table: `engine_signals`
-
-Individual engine evaluation result for every candle evaluation.
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | INTEGER PK | |
-| `index_name` | TEXT | |
-| `timestamp` | DATETIME | |
-| `engine_name` | TEXT | compression / di_momentum / option_chain / etc. |
-| `is_triggered` | BOOLEAN | |
-| `direction` | TEXT | BULLISH / BEARISH / NEUTRAL |
-| `strength` | FLOAT | 0.0 – 1.0 |
-| `score` | FLOAT | 0 – 25 (contribution to confidence) |
-| `features` | TEXT | JSON: {compression_ratio, atr, di_spread, ...} |
-| `reason` | TEXT | Human-readable explanation |
-| `created_at` | DATETIME | |
-
----
-
-### Table: `alerts`
-
-Every Early Move Alert and Trade Signal ever fired.
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | INTEGER PK | |
-| `index_name` | TEXT | |
-| `timestamp` | DATETIME | When alert fired |
-| `alert_type` | TEXT | EARLY_MOVE / TRADE_SIGNAL |
-| `direction` | TEXT | BULLISH / BEARISH |
-| `confidence_score` | FLOAT | 0 – 100 |
-| `engines_triggered` | TEXT | JSON list: ["compression", "di_momentum", ...] |
-| `engines_count` | INTEGER | |
-| `spot_price` | FLOAT | Spot at alert time |
-| `atm_strike` | FLOAT | |
-| `pcr` | FLOAT | |
-| `atr` | FLOAT | |
-| `suggested_instrument` | TEXT | e.g. "NSE:NIFTY27MAR23000CE" |
-| `entry_reference` | FLOAT | |
-| `stop_loss_reference` | FLOAT | spot − 0.8×ATR |
-| `target_reference` | FLOAT | spot + 1.0×ATR |
-| `target1/target2/target3` | FLOAT | T1/T2/T3 levels |
-| `ml_score` | FLOAT | 0–100 ML probability |
-| `ml_phase` | INTEGER | 1 = collecting, 2 = model active |
-| `outcome` | TEXT | WIN / LOSS / NEUTRAL (filled by tracker) |
-| `outcome_pnl` | FLOAT | |
-| `outcome_notes` | TEXT | |
-| `outcome_timestamp` | DATETIME | |
-| `is_valid` | BOOLEAN | Human label (for audit) |
-| `raw_features` | TEXT | Full JSON feature dict |
-| `created_at` | DATETIME | |
-
----
-
-### Table: `trade_outcomes`
-
-Tracks the full lifecycle of every Trade Signal.
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | INTEGER PK | |
-| `alert_id` | INTEGER FK → alerts | |
-| `index_name` | TEXT | |
-| `instrument` | TEXT | Options instrument symbol |
-| `direction` | TEXT | BULLISH / BEARISH |
-| `entry_time` | DATETIME | |
-| `entry_spot` | FLOAT | Spot price at entry |
-| `atr_at_signal` | FLOAT | ATR used for level computation |
-| `spot_sl/spot_t1/spot_t2/spot_t3` | FLOAT | Computed levels |
-| `sl_hit` | BOOLEAN | |
-| `sl_hit_time/sl_hit_spot` | | |
-| `t1_hit/t1_hit_time` | | |
-| `t2_hit/t2_hit_time` | | |
-| `t3_hit/t3_hit_time` | | |
-| `mfe_atr` | FLOAT | Maximum Favorable Excursion ÷ ATR |
-| `mae_atr` | FLOAT | Maximum Adverse Excursion ÷ ATR |
-| `eod_spot` | FLOAT | 15:30 spot price |
-| `exit_time` | DATETIME | |
-| `exit_reason` | TEXT | SL / T3 / EOD |
-| `outcome` | TEXT | WIN / LOSS / NEUTRAL |
-| `pnl/pnl_percent` | FLOAT | |
-| `status` | TEXT | OPEN / CLOSED |
-| `post_close_t1/t2/t3_hit` | BOOLEAN | Did price later reach these levels after SL? |
-| `post_close_max_fav/adv_atr` | FLOAT | Post-close excursion analysis |
-| `post_sl_reversal` | BOOLEAN | Price reversed after SL hit |
-| `post_sl_full_recovery` | BOOLEAN | Price fully recovered past T1 after SL |
-| `post_close_eod_spot` | FLOAT | |
-| `created_at` | DATETIME | |
-
----
-
-### Table: `ml_feature_store`
-
-79+ features extracted at every alert, with outcome feedback for ML training.
-
-Key feature groups:
-
-| Group | Features |
-|---|---|
-| **Engine outputs** | compression_ratio, atr_pct_change, plus_di, minus_di, adx, di_spread, pcr, volume_ratio, sweep_up/down, gamma_flip, iv_expanding, market_regime |
-| **VWAP** | vwap, dist_to_vwap_pct, vwap_cross_up, vwap_cross_down, vwap_bounce, vwap_rejection, vwap_vol_ratio |
-| **Engine trigger flags** | compression_triggered, di_triggered, option_chain_triggered, volume_triggered, liquidity_trap_triggered, gamma_triggered, iv_triggered, vwap_triggered, regime_triggered |
-| **Timing** | mins_since_open, session, is_expiry, day_of_week, dte, candle_completion_pct |
-| **Price context** | spot_vs_prev_pct, atr_pct_spot, chop, efficiency_ratio, gap_pct |
-| **Candle patterns** | prev_body_ratio, prev_bullish, consec_bull, consec_bear, range_expansion |
-| **Index correlation** | aligned_indices, market_breadth |
-| **OI & Futures** | futures_oi_m, futures_oi_chg_pct, atm_oi_ratio |
-| **MTF ADX + DI slopes** | adx_5m, plus_di_5m, minus_di_5m, adx_15m, plus_di_slope_5m, minus_di_slope_5m, plus_di_slope_15m, minus_di_slope_15m |
-| **DI reversal flags** | di_reversal_5m, di_reversal_15m, di_reversal_both (1 = opposing DI fading = reversal setup) |
-| **Price structure** | struct_5m, struct_15m, struct_5m_aligned, struct_15m_aligned, struct_both_aligned (HH/HL/LH/LL encoded) |
-| **VIX** | vix, vix_high |
-| **Signal identity** | direction_encoded, index_encoded, is_trade_signal |
-| **Labels** | label (1=valid, 0=false, -1=unlabeled), sl_hit, t1_hit, t2_hit, t3_hit |
-
----
-
-## 9. ML Pipeline
-
-### Overview
-
-The ML system is self-contained. It collects data passively, labels outcomes automatically, trains when enough data exists, and augments every alert with a probability score.
-
-### Phase 1 — Data Collection (< 100 alerts)
-
-- No model active
-- All alerts use strategy rules only
-- UI shows: `ML: Collecting data (N more samples needed)`
-- Feature data is still saved for future training
-
-### Phase 2 — First Model Training (≥ 100 labeled alerts)
-
-- `ModelManager` detects ≥ 100 labeled records
-- **Temporal split** (not random): oldest 80% = train, newest 20% = test — avoids lookahead bias
-- RandomForest trained first (XGBoost if installed)
-- Model saved to `models/model_vN.pkl`
-- UI shows: `ML v1: MODERATE_BULLISH @ 65.3% [100 samples]`
-- Every subsequent alert shows an ML probability score
-- **ML gate active:** Trade Signals blocked if ML probability < 0.45
-
-### Phase 3 — Continuous Improvement
-
-- Every 50 new labeled samples → automatic retrain
-- Version incremented (v2, v3, ...)
-- Feature importance tracked per version
-
-### Auto-labeling (every 15 minutes)
-
-The `AutoLabeler` runs in background and assigns labels to unlabeled ML records:
-
-```
-For each unlabeled record:
-  Look at the next 5 × 3-min candles after the alert
-
-  If price moved ≥ 0.8 × ATR in the predicted direction:
-    label = 1  (valid signal)
-
-  Elif price moved ≥ 0.5 × ATR against the direction:
-    label = 0  (false signal)
-
-  Else:
-    label = 0  (no meaningful move = false signal)
-```
-
-### ML score interpretation
-
-| ML Score | Recommendation |
-|---|---|
-| ≥ 70% | STRONG (high confidence — take full size) |
-| 55–70% | MODERATE (normal size) |
-| 45–55% | WEAK (reduce size) |
-| < 45% | LOW CONFIDENCE (avoid or skip) |
-
-### Feature importance
-
-After training, XGBoost reports which features matter most. Typically top features include:
-- `engines_count` — how many engines agree
-- `adx` — trend strength
-- `mins_since_open` — time of day
-- `candle_completion_pct` — how formed the candle was
-- `compression_triggered` — volatility coiling present
-
----
-
-## 10. Configuration Reference
-
-All constants are in `nifty_trader/config.py`.
-
-### Time settings
-
-| Constant | Default | Description |
-|---|---|---|
-| `MARKET_OPEN_TIME` | 09:15 | NSE market open |
-| `MARKET_CLOSE_TIME` | 15:30 | NSE market close |
-| `SIGNAL_START_TIME` | 09:20 | Earliest signal window |
-| `SIGNAL_END_TIME` | 15:00 | Latest signal window |
-| `EXPIRY_DAY_SIGNAL_END_TIME` | 14:45 | Earlier cutoff on expiry day |
-
-### Data fetching
-
-| Constant | Default | Description |
-|---|---|---|
-| `CANDLE_INTERVAL_MINUTES` | 3 | Primary candle interval |
-| `DATA_FETCH_INTERVAL_SECONDS` | 5 | Tick frequency |
-| `CANDLE_HISTORY_COUNT` | 125 | Candles loaded at startup (~6.5 hours) |
-| `OC_REFRESH_INTERVAL_SECONDS` | 15 | Option chain refresh |
-| `OC_STALENESS_THRESHOLD_SEC` | 60 | Reject option chain older than this |
-
-### Signal thresholds
-
-| Constant | Default | Description |
-|---|---|---|
-| `MIN_ENGINES_FOR_ALERT` | 4 | Early Move Alert threshold (of 7 triggering engines) |
-| `MIN_ENGINES_FOR_SIGNAL` | 4 | Trade Signal threshold |
-| `SIGNAL_MIN_CANDLE_COMPLETION` | 0.33 | Candle must be ≥ 33% formed |
-| `BREAKOUT_ATR_MULTIPLIER` | 1.0 | ATR multiple required for breakout confirm |
-| `SIGNAL_MIN_VOLUME_RATIO` | 0.8 | Min volume vs 20-period average to allow Trade Signal |
-| `SIGNAL_MIN_PCR` | 0.7 | Min PCR to allow Trade Signal |
-| `TRADE_SIGNAL_MIN_ADX` | 20.0 | Min ADX on 3m candle — below this trend is too weak |
-| `TRADE_SIGNAL_MIN_DI_SPREAD` | 5.0 | Min \|DI spread\| in signal direction |
-| `TRADE_SIGNAL_REQUIRE_MTF_STRONG` | True | Both 5m+15m must agree (STRONG); PARTIAL/NEUTRAL blocked |
-| `ML_SIGNAL_GATE_THRESHOLD` | 0.45 | Min ML probability to allow Trade Signal (Phase 2+) |
-
-### Engine thresholds
-
-| Engine | Key constant | Default |
-|---|---|---|
-| Compression | `COMPRESSION_RANGE_RATIO` | 0.70 |
-| Compression | `ATR_DECLINING_LOOKBACK` | 3 candles |
-| DI Momentum | `DI_SPREAD_WIDENING_THRESHOLD` | 2.0 points |
-| DI Momentum | `DI_SPREAD_PCT_THRESHOLD` | 0.15 (15%) |
-| Volume | `VOLUME_SPIKE_MULTIPLIER` | 1.5 |
-| Volume | `VOLUME_AVERAGE_PERIOD` | 20 candles |
-| Liquidity Trap | `LIQUIDITY_SWEEP_LOOKBACK` | 10 candles |
-| Liquidity Trap | `LIQUIDITY_WICK_RATIO` | 0.50 |
-| Gamma | `GAMMA_WALL_PROXIMITY_PCT` | 0.002 (0.2%) |
-| VWAP | `VWAP_TOUCH_ATR_MULT` | 0.5 (0.5×ATR band) |
-| VWAP | `VWAP_VOL_RATIO_MIN` | 1.2 (volume ≥ 1.2× avg) |
-| VWAP | `VWAP_BODY_MIN_RATIO` | 0.35 (body ≥ 35% of range) |
-| Market Regime | `REGIME_ADX_TRENDING` | 25.0 |
-| Market Regime | `CHOP_RANGING_THRESHOLD` | 61.8 |
-| Market Regime | `CHOP_TRENDING_THRESHOLD` | 38.2 |
-| Option Chain *(data-only)* | `OI_CHANGE_SIGNIFICANCE` | 0.03 (3%) |
-| IV Expansion *(data-only)* | `IV_EXPANSION_THRESHOLD` | 0.10 (10%) |
-
-### MTF alignment
-
-| Constant | Default | Description |
-|---|---|---|
-| `MTF_SCORE_BONUS` | +15 | Both TFs agree |
-| `MTF_SCORE_PARTIAL_BONUS` | +7 | One TF agrees |
-| `MTF_SCORE_WEAK_PENALTY` | −7 | One TF opposes |
-| `MTF_SCORE_OPPOSING_PENALTY` | −12 | Both TFs oppose |
-| `MTF_MIN_ADX` | 15.0 | Min ADX to call a TF direction |
-| `MTF_BLOCK_ON_OPPOSING` | True | Block Trade Signal when both TFs oppose |
-
-### Outcome tracking
-
-| Constant | Default | Description |
-|---|---|---|
-| `OUTCOME_SL_ATR_MULT` | 0.8 | SL = entry ± 0.8 × ATR |
-| `OUTCOME_T1_ATR_MULT` | 1.0 | T1 = entry ± 1.0 × ATR |
-| `OUTCOME_T2_ATR_MULT` | 1.5 | T2 = entry ± 1.5 × ATR |
-| `OUTCOME_T3_ATR_MULT` | 2.2 | T3 = entry ± 2.2 × ATR |
-| `OUTCOME_EOD_TIME` | 15:30 | Force-close all open trades |
-
-### ML settings
-
-| Constant | Default | Description |
-|---|---|---|
-| `ML_MIN_SAMPLES_TO_ACTIVATE` | 100 | Samples before first training |
-| `ML_RETRAIN_INTERVAL_SAMPLES` | 50 | New samples before retraining |
-| `ML_LOOKAHEAD_CANDLES` | 5 | Candles to check for labeling |
-| `ML_VALID_MOVE_ATR_MULT` | 0.8 | Min ATR move to label as valid |
-| `AUTO_LABEL_INTERVAL_SECONDS` | 900 | 15 minutes |
-
-### Index-specific settings
-
-| Index | Lot size | Strike gap | Exchange |
-|---|---|---|---|
-| NIFTY | 75 | 50 | NSE |
-| BANKNIFTY | 30 | 100 | NSE |
-| MIDCPNIFTY | 120 | 25 | NSE |
-| SENSEX | 20 | 100 | BSE |
-
----
-
-## 11. Data Flow
-
-### Startup sequence
-
-```
-1. Load config (credentials, indices, thresholds)
-2. Connect to broker (load cached token or prompt for auth)
-3. DataManager.start()
-   a. Fetch 125 × 3-min candles per index (past 3 days)
-   b. Fetch 80 × 5-min, 30 × 15-min candles per index
-   c. Fetch current option chain per index
-   d. Fetch near-month futures candles (OI = 0, filled by quotes tick)
-   e. Restore intraday OI history from DB
-   f. Compute initial indicators (ATR, DI, ADX, volume SMA)
-4. OutcomeTracker._rehydrate()
-   → Reload any OPEN trade outcomes from previous session
-5. ModelManager.start()
-   → Check for existing models, load latest active model
-6. AutoLabeler.start()
-   → Begin 15-min labeling loop
-7. Start UI
-```
-
-### Tick loop (every 5 seconds, 09:15–15:30)
-
-```
-For each tick:
-  1. Batch-fetch spot prices (all 4 indices, one API call)
-  2. Batch-fetch futures quotes (OI + lp, one API call)
-  3. For each index:
-     a. Fetch latest forming 3-min candle
-     b. If new candle started:
-        - Close previous candle → save to DB
-        - Fire any pending Trade Signal confirmations
-     c. Merge futures volume into spot candle (if USE_FUTURES_VOLUME=True)
-     d. Update IndexState (spot, candles, futures OI)
-     e. Recompute indicators on updated DataFrame
-     f. Every 15s: fetch option chain, save snapshot to DB
-  4. Run SignalAggregator.evaluate() for each index
-  5. OutcomeTracker.tick(spot_prices) — check SL/T1/T2/T3 levels
-  6. Emit DataBridge.data_updated() → UI refresh
-```
-
-### Signal evaluation (per candle, per index)
-
-```
-1. Run all 8 engines on latest df, df_5m, df_15m, option_chain, futures_df
-2. Collect triggered engines, directions, scores
-3. Compute consensus direction (majority of triggered engines)
-4. Compute confidence = sum of triggered engine scores (0–100)
-5. Apply MTF alignment score delta
-6. Check alert conditions:
-   - existing_alert check (Path A) or quiet-breakout check (Path B)
-   - cooldown: has a Trade Signal fired recently?
-   - market hours: within 09:20–15:00?
-7. If Early Move conditions met AND not recently saved:
-   - save_alert(EARLY_MOVE) to DB
-   - Return alert to UI every tick (for live confidence updates)
-8. If Trade Signal conditions met:
-   - save_alert(TRADE_SIGNAL) to DB
-   - Buffer in _pending_confirm
-9. On next candle open:
-   - Fire buffered Trade Signal as CONFIRMED
-   - AlertManager dispatches to all channels
-10. Extract 60+ ML features, save to ml_feature_store
+┌─────────────────────────────────────────────────────────┐
+│                   FYERS BROKER API                       │
+│  Live quotes  |  Options chain  |  Historical candles    │
+│  Futures OI   |  Expiry dates   |  VIX                   │
+└──────────────────────────┬──────────────────────────────┘
+                           │  (every 5s for spots;
+                           │   every 15s for OC + expiry update)
+              ┌────────────▼────────────┐
+              │     DATA MANAGER        │
+              │  3m / 5m / 15m candles  │
+              │  OI history persisted   │
+              │  Expiry cache updated   │
+              └────────────┬────────────┘
+                           │
+         ┌─────────────────▼──────────────────┐
+         │         SIGNAL AGGREGATOR           │
+         │  Runs all 6 triggering + 2 data    │
+         │  engines every 3 minutes            │
+         │  EARLY MOVE → TRADE → CONFIRMED    │
+         └──────┬──────────────────┬───────────┘
+                │                  │
+    ┌───────────▼──┐    ┌──────────▼──────────────────────┐
+    │ ALERT SYSTEM │    │  ML FEATURE STORE               │
+    │ UI notify    │    │  93 features → ml_feature_records│
+    │ Sound/popup  │    │                                  │
+    │ Telegram     │    │  SETUP SCREENER                  │
+    └───────────┬──┘    │  23 setups → setup_alerts        │
+                │       └──────────┬──────────────────────┘
+                │                  │
+    ┌───────────▼──┐    ┌──────────▼──────────┐
+    │  UI DISPLAY  │    │   AUTO LABELER      │
+    │  All 7 tabs  │    │  T1/T2/T3/SL grading│
+    └──────────────┘    │  P&L propagation    │
+                        └──────────┬──────────┘
+                                   │
+                        ┌──────────▼──────────┐
+                        │  OUTCOME TRACKER    │
+                        │  Live SL/T1/T2/T3   │
+                        │  Realized P&L (₹)   │
+                        └──────────┬──────────┘
+                                   │
+                        ┌──────────▼──────────┐
+                        │   ML MODEL TRAINER  │
+                        │  XGBoost / RF       │
+                        │  Auto-retrain loop  │
+                        └─────────────────────┘
 ```
 
 ---
 
-## 12. File Structure
+## 18. Expiry Calendar — How Dates Are Managed
 
-```
-nifty_trader/
-├── main.py                          Entry point, logging setup, Qt app start
-├── config.py                        All constants and thresholds
-│
-├── data/
-│   ├── base_api.py                  Abstract broker adapter interface
-│   ├── data_manager.py              IndexState + DataManager (tick loop)
-│   ├── structures.py                Candle, OptionChain, OptionStrike, BrokerConnectionState
-│   ├── expiry_calendar.py           Expiry date computation
-│   └── adapters/
-│       ├── fyers_adapter.py         Fyers OAuth2 + REST API
-│       ├── mock_adapter.py          Synthetic data (GBM simulation)
-│       ├── dhan_adapter.py          Dhan API stub
-│       ├── kite_adapter.py          Kite Connect stub
-│       └── upstox_adapter.py        Upstox API stub
-│
-├── engines/
-│   ├── signal_aggregator.py         Central orchestration — runs all engines, emits alerts
-│   ├── compression.py               Engine 1: volatility coiling
-│   ├── di_momentum.py               Engine 2: directional pressure
-│   ├── option_chain.py              Engine 3: smart money OI/PCR
-│   ├── volume_pressure.py           Engine 4: institutional volume
-│   ├── liquidity_trap.py            Engine 5: stop-hunt detection
-│   ├── gamma_levels.py              Engine 6: MM hedging walls
-│   ├── iv_expansion.py              Engine 7: IV surge
-│   ├── market_regime.py             Engine 8: trending/ranging/volatile
-│   └── mtf_alignment.py             MTF consensus scoring
-│
-├── database/
-│   ├── models.py                    SQLAlchemy ORM models (6 tables)
-│   └── manager.py                   DatabaseManager — CRUD + migrations
-│
-├── ml/
-│   ├── feature_store.py             FEATURE_COLUMNS list + XGBoost/RF classifiers
-│   ├── model_manager.py             Train/load/predict + version management
-│   ├── outcome_tracker.py           SL/T1/T2/T3 level hit tracking
-│   └── auto_labeler.py              Background outcome labeling (15-min loop)
-│
-├── alerts/
-│   ├── alert_manager.py             Multi-channel dispatcher (UI + sound + popup + Telegram)
-│   └── telegram_alert.py            Telegram bot message sender
-│
-└── ui/
-    ├── main_window.py               MainWindow + DataBridge Qt signals
-    ├── dashboard_tab.py             IndexCard + FuturesPanel (OI classification)
-    ├── scanner_tab.py               EngineStatusWidget per index
-    ├── alerts_tab.py                Alert table + trade card + outcome detail
-    ├── hq_trades_tab.py             Detailed trade analytics
-    ├── options_flow_tab.py          Options positioning (future feature)
-    ├── credentials_tab.py           Broker auth + settings
-    └── ml_report_widget.py          ML analytics (developer mode)
-```
+The expiry calendar works in two layers:
+
+### Layer 1 — Broker Data (Primary, Always Used in Live Trading)
+- Every option chain refresh (every 15s in the tick loop) calls `get_expiry_dates(idx)` from the Fyers adapter
+- All returned expiry dates (weekly + monthly) are parsed and stored in `_option_expiry_cache`
+- Monthly futures expiry is derived: the last expiry date of each calendar month
+- Thread-safe: all reads and writes go through a `threading.Lock()`
+
+### Layer 2 — Hardcoded Fallback (Only Before Broker Connects)
+- Used only when the cache is empty (first boot, before first OC refresh)
+- Uses weekday math based on current SEBI rules (Sep 2025+)
+- Never used in live trading once broker connects
+
+### Functions Available
+| Function | Returns |
+|----------|---------|
+| `get_current_option_expiry(index)` | Nearest weekly option expiry date |
+| `days_to_option_expiry(index)` | Calendar days to next option expiry |
+| `is_option_expiry_day(index)` | True if today is expiry day |
+| `all_option_expiries(index)` | All future option expiry dates |
+| `get_current_futures_expiry(index)` | Nearest monthly futures expiry date |
+| `days_to_futures_expiry(index)` | Calendar days to next futures expiry |
+| `expiry_summary()` | Full summary dict for all indices (used for logging) |
 
 ---
 
-## 13. Outcome Tracking
+## 19. Production Fixes Applied (v3.0 → v3.1)
 
-### How it works
+12 bugs fixed before production deployment:
 
-When a Trade Signal fires, `OutcomeTracker.register()` creates a `TradeOutcome` row and begins monitoring the trade every 5 seconds.
-
-### Level hit logic (Phase 1 — OPEN)
-
-```
-Every 5 seconds:
-  For each OPEN trade:
-    spot = current spot price of index
-
-    If direction == BULLISH:
-      MFE = max(MFE, spot − entry_spot)        # best run
-      MAE = max(MAE, entry_spot − spot)         # worst drawdown
-
-      If spot ≤ SL level:   → SL_HIT → LOSS → move to Phase 2
-      If spot ≥ T1 level:   → T1 milestone (stays OPEN)
-      If spot ≥ T2 level:   → T2 milestone (stays OPEN)
-      If spot ≥ T3 level:   → T3_HIT → WIN → move to Phase 2
-
-    At 15:30 EOD: → force close all remaining as EOD
-```
-
-### Post-close monitoring (Phase 2)
-
-After a trade closes (SL hit or T3 hit), monitoring continues until 15:30:
-
-- Did price later reach T1, T2, T3 even after closing? (`post_close_t1/t2/t3_hit`)
-- What was the maximum favorable excursion post-close?
-- Did price fully reverse after SL hit? (`post_sl_reversal`, `post_sl_full_recovery`)
-
-This data answers: "Was my SL too tight?" and "Did the original signal eventually work?"
-
-### Outcome→ML feedback loop
-
-When a trade closes, the outcome is written back to the corresponding `ml_feature_store` row:
-- `sl_hit`, `t1_hit`, `t2_hit`, `t3_hit` flags updated
-- `AutoLabeler` uses these in the next labeling pass
-- Next model retrain includes this outcome-validated data
+| ID | Severity | What Was Fixed |
+|----|----------|----------------|
+| C-1 | Critical | ML feature key collision in `_get_ml_prediction` — `iv_rank`, `volume_ratio`, `adx` were silently overwritten when multiple engine dicts were flattened. Model trained on correct keys but predicted on wrong values. Fixed with explicit per-engine mapping. |
+| H-1 | High | `SetupScreener.evaluate()` would crash if any engine result was `None`. Added guard at top of method: returns empty list if any required parameter is None. |
+| H-2 | High | `_build_trade_signal` used `config.SYMBOL_MAP[index_name]` — unguarded `KeyError` if unknown index. Changed to `.get()` with defaults (`strike_gap=50`, `lot_size=1`). |
+| H-3 | High | `get_model_manager()` singleton had no thread lock. Two threads at startup could create two `ModelManager` instances. Fixed with double-checked locking. |
+| M-1 | Medium | `Setup.matches()` silently returned False on any exception. Typos in feature key names disabled setups with no feedback. Added `logger.debug()` for `KeyError`/`TypeError`. |
+| M-2 | Medium | `expiry_calendar.py` module-level dicts had no thread lock. Concurrent reads during writes could see torn state. Added `threading.Lock()` with snapshot pattern for reads. |
+| M-3 | Medium | `OrderManager` accessed `ot._lock` and `ot._open` directly on `OutcomeTracker`. Replaced with new public `OutcomeTracker.get_open_states()` method. |
+| M-4 | Medium | `DataManager.reconnect()` joined old threads with 3s timeout but started new threads even if join timed out. Increased timeout to 6s; thread references nulled before join. |
+| M-5 | Medium | `AlertManager._dispatched_ids` grew indefinitely (never cleared). Added daily reset at midnight using `_dispatched_date` tracking. |
+| L-1 | Low | `_show_popup()` created a new `ToastNotifier` on every call (slow, not thread-safe). Converted to instance method using singleton created in `__init__`. |
+| L-2 | Low | `_get_fyers()` re-read the token file on every failed refresh cycle (every 15s). Added 60-second backoff on failure using `_fyers_failed_at` timestamp. |
+| L-3 | Low | `_diag_logged` set in `SignalAggregator` grew one entry per index per minute forever. Now pruned to only current minute's entries on every evaluation (max 4 entries). |
 
 ---
 
-## 14. Troubleshooting
+## 20. Glossary — Simple Definitions
 
-### No Trade Signals firing
-
-**Check 1 — Engine count:** Open the Scanner tab. Are ≥ 5 engines triggering?
-
-**Check 2 — Volume gate:** For cash indices, Fyers returns near-zero spot volume. The aggregator relaxes the gate to `vol_spike OR vol_triggered OR range_ok`. If volume is genuinely 0, signals can still fire.
-
-**Check 3 — Market hours:** Trade Signals only fire 09:20–15:00 (14:45 on expiry day).
-
-**Check 4 — MTF blocking:** If both 5-min and 15-min oppose the 3-min direction, Trade Signals are blocked (Early Alerts still fire).
-
-**Check 5 — Compression breakout:** Trade Signal requires a compression breakout (close beyond ± 1×ATR of compression range). If no compression pattern exists, Path B (quiet breakout) fires if ≥ 10 min of silence + 1.5×ATR candle.
-
----
-
-### OI showing "--" in dashboard
-
-The INDEX FUTURES OI column shows "--" when `oi = 0.0` for the latest futures candle.
-
-**Root cause:** `get_all_futures_quotes()` builds the near-month futures symbol (e.g., `NSE:NIFTY26MARFUT`) and fetches OI via Fyers quotes API. If there's a symbol format mismatch between what we construct and what Fyers returns, OI won't be set.
-
-**Diagnostics:** Check the log file (`logs/niftytrader_YYYYMMDD.log`) during market hours for:
-- `WARNING: Futures quotes API error:` → Fyers API call failing
-- `WARNING: Futures quotes: unrecognised symbol 'X'` → symbol mismatch
-
-**Note:** OI is only available during market hours. Outside hours, Fyers returns `oi=0`.
-
----
-
-### Early Alerts but no Trade Signals — SENSEX sending too many
-
-**SENSEX Trade Signal spam was a known bug** (12 signals in 26 minutes). Root cause: cooldown check ran AFTER DB write — signal was saved to DB then returned None to UI. Fixed by checking cooldown BEFORE save. If you see this in an older build, update to the latest version.
-
----
-
-### Sensitivity slider resets on restart
-
-The slider state is persisted in `user_settings.json`. If the file is deleted or corrupted, the slider resets to default (balanced = `MIN_ENGINES_FOR_SIGNAL = 5`).
-
----
-
-### ML score always "Collecting data"
-
-The XGBoost model activates after 100 labeled samples. Labels are assigned by `AutoLabeler` every 15 minutes by looking at price movement 5 candles after each alert. You need 100 Trade Signals that have been labeling-eligible (15+ minutes have passed since the alert) before the model activates.
+| Term | Simple Meaning |
+|------|---------------|
+| **ATR** | Average True Range — how much the index typically moves in one 3-minute candle |
+| **ADX** | A number (0–100) measuring how strong the current trend is. Above 25 = strong trend |
+| **+DI / -DI** | Directional Indicators — +DI measures bullish strength, -DI measures bearish strength |
+| **DI aligned** | When the winning DI (+ or -) matches the direction of our signal |
+| **DI spread** | `+DI − -DI`. Positive = bulls winning. Negative = bears winning. Must be ≥ 5 in signal direction for a trade signal. |
+| **Trending Regime** | Confirmed trending market (not choppy). Most powerful filter in the system |
+| **PCR** | Put-Call Ratio. Above 1.2 = more puts than calls = bearish positioning |
+| **OI** | Open Interest — total number of open options contracts at a strike |
+| **IV / IV Rank** | Implied Volatility — how expensive options are. High IV = expensive premium |
+| **VWAP** | Volume Weighted Average Price — the "fair price" of the day (resets at 9:15 IST) |
+| **Gamma Wall** | A price level where large options OI creates support/resistance |
+| **ATM** | At The Money — the options strike closest to the current index price |
+| **ITM** | In The Money — one strike deeper than ATM. Higher delta (~0.62) |
+| **CE** | Call Option (you profit if price goes UP) |
+| **PE** | Put Option (you profit if price goes DOWN) |
+| **T1 / T2 / T3** | Target 1, 2, 3 — graded profit levels (1.0×ATR, 1.5×ATR, 2.2×ATR from entry) |
+| **SL** | Stop Loss — exit price to limit loss (0.8×ATR from entry) |
+| **Win Rate** | Out of 100 trades, how many were winners. 57% = 57 wins out of 100 |
+| **Lift** | How much better than random. 4.4× lift = 4.4× better than no filter |
+| **Engines count** | How many of the 6 triggering engines fired on the same candle |
+| **Label quality** | Grade of the win: 0=SL, 1=T1 reached, 2=T2 reached, 3=T3 reached |
+| **Compression** | When the market moves in a very tight range — energy building before a breakout |
+| **Liquidity trap** | A candle with a long wick — big players swept retail stop-losses |
+| **Market breadth** | How many of the 4 indices are moving in the same direction simultaneously |
+| **Mock mode** | App running without live broker — uses simulated data for testing |
+| **DTE** | Days To Expiry — how many days until the current options contract expires |
+| **Choppiness Index** | Measures if market is trending or sideways. Below 61.8 = trending |
+| **lot_size** | Contracts per lot: NIFTY=50, BANKNIFTY=15, MIDCPNIFTY=75, SENSEX=10 |
+| **Investment** | `entry_premium × lot_size` — rupees at risk per lot when entering the trade |
+| **Realized P&L** | Actual rupee profit or loss after the trade closes |
+| **Setup** | A named trading condition (e.g., S20_DI_VOL_TREND) with a known win rate from testing |
+| **Setup grade** | A++ to D — quality rating of a setup based on backtested win rate |
+| **PAPER mode** | Simulated trading — calculates P&L from live OutcomeTracker without real orders |
+| **LIVE mode** | Real Fyers bracket orders placed at the exchange |
+| **alert_type** | Distinguishes TRADE_SIGNAL from CONFIRMED_SIGNAL in the DB — prevents double-counting in win-rate statistics |
+| **Excess basis** | Futures price premium above theoretical fair value — indicates institutional long or short bias |
+| **OI regime** | Long buildup / short buildup / short covering / long unwinding — classified from price+OI direction |
+| **Pre-open gap** | `(futures_LTP at 9:00-9:14) / prev_close − 1` × 100 — frozen at 9:15 as a session ML feature |
 
 ---
 
-### Token expired / auth required every day
+## Summary — The Most Important Points
 
-Fyers tokens expire at midnight IST. This is a Fyers platform limitation — the token cannot be refreshed programmatically. You must repeat the OAuth flow each trading day. Consider using the **Set Token Direct** option if you have an automated way to fetch your token.
+### For Someone Who Wants to Use This System
+
+1. **Connect Fyers** — live broker connection required for real signals
+2. **Set minimum engines to 4** — filters out low-quality signals
+3. **Enable Trending Regime filter** — single most powerful improvement (57% WR)
+4. **NIFTY is the most reliable index** — take both bull and bear signals
+5. **BANKNIFTY — bear signals only** — bull signals historically weak (21–32% WR)
+6. **Volume confirmation** — when volume is ≥ 1.5× normal, WR jumps to 67–83%
+7. **Watch the Setup Performance tab** — sort by TOTAL P&L ₹ to see which setups make real money
+8. **Do not trade VWAP signals alone** — 1.7% win rate in testing
+
+### For Someone Who Wants to Improve This System
+
+1. Accumulate 500+ labeled live records, then train the ML model (`force_retrain()` from UI)
+2. Run the historical trainer for 365 days: `python -m ml.historical_trainer --days 365`
+3. After ML activates (Phase 2), the probability gate filters low-quality signals automatically
+4. Monitor `Setup Performance` tab — A++ setups with 10+ trades are most reliable
+5. Check `expiry_summary()` logs to verify broker is providing fresh expiry dates daily
 
 ---
 
-### Log file location
-
-```
-logs/niftytrader_YYYYMMDD.log
-```
-
-Log level is INFO by default. All WARNING and ERROR messages are always visible. DEBUG messages (detailed OI diagnostics, engine sub-conditions) require changing the log level in `main.py`:
-
-```python
-logging.basicConfig(level=logging.DEBUG, ...)
-```
-
----
-
-*End of documentation — NiftyTrader Intelligence v3.0*
+*Document last updated: March 2026*
+*System version: NiftyTrader Intelligence v3.1 — Production Ready*
+*12 production bugs fixed; all thread-safety, ML correctness, and P&L tracking verified*

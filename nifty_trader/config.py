@@ -71,7 +71,7 @@ INDICES = ["NIFTY", "BANKNIFTY", "MIDCPNIFTY", "SENSEX"]
 SYMBOL_MAP = {
     "NIFTY": {
         "spot_symbol":   "NSE:NIFTY50-INDEX",
-        "lot_size":      50,
+        "lot_size":      65,    # SEBI revised — updated Mar 2026
         "strike_gap":    50,
         "dhan_security_id": "13",
         "kite_symbol":   "NIFTY 50",
@@ -79,7 +79,7 @@ SYMBOL_MAP = {
     },
     "BANKNIFTY": {
         "spot_symbol":   "NSE:NIFTYBANK-INDEX",
-        "lot_size":      15,
+        "lot_size":      30,    # SEBI revised — updated Mar 2026
         "strike_gap":    100,
         "dhan_security_id": "25",
         "kite_symbol":   "NIFTY BANK",
@@ -87,7 +87,7 @@ SYMBOL_MAP = {
     },
     "MIDCPNIFTY": {
         "spot_symbol":   "NSE:NIFTYMIDCPSEL-INDEX",
-        "lot_size":      75,
+        "lot_size":      120,   # SEBI revised — updated Mar 2026
         "strike_gap":    25,
         "dhan_security_id": "27",
         "kite_symbol":   "NIFTY MIDCAP SELECT",
@@ -95,7 +95,7 @@ SYMBOL_MAP = {
     },
     "SENSEX": {
         "spot_symbol":   "BSE:SENSEX-INDEX",
-        "lot_size":      10,
+        "lot_size":      20,    # SEBI revised — updated Mar 2026
         "strike_gap":    100,
         "dhan_security_id": "",
         "kite_symbol":   "SENSEX",
@@ -226,7 +226,6 @@ SIGNAL_STRICT_INDICES         = ["SENSEX"]     # 38.4% win — require higher co
 SIGNAL_STRICT_MIN_CONFIDENCE  = 60.0           # min confidence% for strict indices
 
 # Quality gates for trade signal confirmation (data-driven thresholds)
-SIGNAL_MIN_VOLUME_RATIO       = 0.8   # lowered from 1.0 — 0.8-1.0 band allowed through for ML learning
 SIGNAL_MIN_PCR                = 0.7   # PCR < 0.7 = 11% win rate, block
 
 # Forming-candle guard: block Trade Signal if we are still in the first
@@ -251,6 +250,27 @@ MTF_BLOCK_ON_OPPOSING         = True
 TRADE_SIGNAL_MIN_ADX          = 20.0   # Min ADX on 3m candle — below this trend is too weak
 TRADE_SIGNAL_MIN_DI_SPREAD    = 5.0    # Min |DI spread| in signal direction (+DI>-DI for BULLISH)
 TRADE_SIGNAL_REQUIRE_MTF_STRONG = True  # Require STRONG MTF (both 5m+15m agree); PARTIAL/NEUTRAL blocked
+
+# ── Trending Regime Gate (tested: 55.8% WR vs 12.8% base = 4.37x lift) ────
+# When True, Trade Signals only fire when market_regime = TRENDING.
+# AMBIGUOUS / RANGING / VOLATILE regimes are blocked.
+# Set False to collect more ML data; set True for live trading quality.
+REQUIRE_TRENDING_REGIME       = True
+
+# ── Volume Confirmation Gate (tested: +10% WR boost over trending alone) ──
+# Minimum volume_ratio for a Trade Signal when trending regime is active.
+# 1.5 = volume must be 50% above 20-bar average (NIFTY 83% WR at this level).
+# 0.8 = collect all signals for ML learning (current setting pre-test).
+SIGNAL_MIN_VOLUME_RATIO       = 1.5    # raised from 0.8 after 6-day live testing
+
+# ── Index Direction Filter (data-driven, per-index) ────────────────────────
+# Restrict certain indices to one direction only based on win-rate analysis.
+# BANKNIFTY: bull WR=21-32%, bear WR=71% → bear-only until bull data improves.
+# SENSEX:    bull WR=41%,    bear WR=59% → both allowed (no hard block yet).
+# Empty string "" = both directions allowed.
+INDEX_DIRECTION_FILTER        = {
+    "BANKNIFTY": "BEARISH",   # 71% WR bear vs 21-32% bull — block bull signals
+}
 CONFIDENCE_WEIGHTS = {
     "compression":    15,
     "di_momentum":    20,

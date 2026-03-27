@@ -90,6 +90,16 @@ class MarketDataAPI(ABC):
         """
         return []
 
+    def get_lot_size(self, index_name: str) -> int:
+        """
+        Return the current lot size for the index as reported by the broker.
+        Default: return the value already in config.SYMBOL_MAP (hardcoded fallback).
+        Adapters should override to fetch the live value from the broker and
+        write it back to config.SYMBOL_MAP so all downstream code stays in sync.
+        """
+        import config as _cfg
+        return _cfg.SYMBOL_MAP.get(index_name, {}).get("lot_size", 1)
+
     def get_broker_name(self) -> str:
         return self.__class__.__name__.replace("MarketDataAPI", "").replace("Adapter", "")
 

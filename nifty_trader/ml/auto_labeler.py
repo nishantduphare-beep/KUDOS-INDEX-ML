@@ -101,7 +101,7 @@ class AutoLabeler:
         labeled = 0
         with self._db.get_session() as session:
             from database.models import (MLFeatureRecord, MarketCandle, Alert,
-                                         TradeOutcome, OptionChainSnapshot)
+                                         TradeOutcome, OptionChainSnapshot, SetupAlert)
             from sqlalchemy import and_, or_
 
             # Use datetime.now() (local time) — records are stored with datetime.now()
@@ -205,6 +205,20 @@ class AutoLabeler:
                     record.label_quality = quality
                     record.label_direction = self._direction_from_label(label, alert)
                     labeled += 1
+
+                    # Propagate labels to setup_alerts rows for the same alert
+                    if record.alert_id:
+                        session.query(SetupAlert).filter(
+                            SetupAlert.alert_id == record.alert_id,
+                            SetupAlert.label == -1,
+                        ).update({
+                            "label":         label,
+                            "label_quality": quality,
+                            "t1_hit":        quality >= 1,
+                            "t2_hit":        quality >= 2,
+                            "t3_hit":        quality >= 3,
+                            "sl_hit":        label == 0 and quality == 0,
+                        }, synchronize_session=False)
 
         return labeled
 
