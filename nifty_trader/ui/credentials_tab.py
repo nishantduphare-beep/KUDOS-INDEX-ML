@@ -24,7 +24,6 @@ Token persistence:
   • All other fields saved to auth/credentials.json (base64 obfuscated)
 """
 
-import base64
 import json
 import logging
 import os
@@ -62,12 +61,57 @@ class ConnBridge(QObject):
 
 
 # ──────────────────────────────────────────────────────────────────
-# Tiny helpers
+# Secure credential storage via OS keyring
+# Falls back to base64 obfuscation if keyring is unavailable
+# (e.g. headless CI environments with no secret service).
 # ──────────────────────────────────────────────────────────────────
-def _enc(s): return base64.b64encode(s.encode()).decode() if s else ""
-def _dec(s):
-    try: return base64.b64decode(s.encode()).decode() if s else ""
-    except: return s
+_KEYRING_SERVICE = "NiftyTrader"
+
+try:
+    import keyring as _keyring
+    _KEYRING_OK = True
+except ImportError:
+    _KEYRING_OK = False
+    logger = logging.getLogger(__name__)
+    logging.getLogger(__name__).warning(
+        "keyring not installed — credentials stored as base64 (run: pip install keyring)"
+    )
+
+def _save_secret(key: str, value: str):
+    """Store a credential securely in the OS keyring."""
+    if not value:
+        _delete_secret(key)
+        return
+    if _KEYRING_OK:
+        _keyring.set_password(_KEYRING_SERVICE, key, value)
+    else:
+        import base64
+        # base64 fallback — not secure, just obfuscated
+        _FALLBACK_STORE[key] = base64.b64encode(value.encode()).decode()
+
+def _load_secret(key: str) -> str:
+    """Retrieve a credential from the OS keyring."""
+    if _KEYRING_OK:
+        return _keyring.get_password(_KEYRING_SERVICE, key) or ""
+    else:
+        import base64
+        v = _FALLBACK_STORE.get(key, "")
+        try:
+            return base64.b64decode(v.encode()).decode() if v else ""
+        except Exception:
+            return v
+
+def _delete_secret(key: str):
+    """Remove a credential from the OS keyring (best-effort)."""
+    if _KEYRING_OK:
+        try:
+            _keyring.delete_password(_KEYRING_SERVICE, key)
+        except Exception:
+            pass
+    else:
+        _FALLBACK_STORE.pop(key, None)
+
+_FALLBACK_STORE: dict = {}   # used only when keyring is unavailable
 
 def _lbl(text, color="#8b949e", bold=False, size=11):
     w = QLabel(text)
@@ -652,17 +696,25 @@ class CredentialsTab(QWidget):
 
     def _persist(self):
         AUTH_DIR.mkdir(exist_ok=True)
+        # Store secrets in OS keyring — credentials.json holds only metadata
+        # (which keys exist, broker choice, non-sensitive flags).
+        stored_keys: dict = {}
+        for broker, creds in config.BROKER_CREDENTIALS.items():
+            stored_keys[broker] = []
+            for k, v in creds.items():
+                if v and k != "token_expiry":
+                    _save_secret(f"{broker}_{k}", v)
+                    stored_keys[broker].append(k)
+        _save_secret("telegram_bot_token", config.TELEGRAM_BOT_TOKEN or "")
+        _save_secret("telegram_chat_id",   config.TELEGRAM_CHAT_ID   or "")
         payload = {
-            "broker": config.BROKER,
-            "credentials": {
-                b: {k: _enc(v) for k, v in c.items() if v and k != "token_expiry"}
-                for b, c in config.BROKER_CREDENTIALS.items()
-            },
+            "broker":      config.BROKER,
+            "stored_keys": stored_keys,
             "telegram": {
-                "enabled":   config.TELEGRAM_ENABLED,
-                "bot_token": _enc(config.TELEGRAM_BOT_TOKEN),
-                "chat_id":   _enc(config.TELEGRAM_CHAT_ID),
-            }
+                "enabled": config.TELEGRAM_ENABLED,
+            },
+            # Fallback store for environments without OS keyring
+            "_fallback": _FALLBACK_STORE if not _KEYRING_OK else {},
         }
         CREDS_FILE.write_text(json.dumps(payload, indent=2))
 
@@ -670,13 +722,39 @@ class CredentialsTab(QWidget):
         if not CREDS_FILE.exists(): return
         try:
             data = json.loads(CREDS_FILE.read_text())
-            for broker, creds in data.get("credentials", {}).items():
-                if broker in config.BROKER_CREDENTIALS:
-                    for k, v in creds.items():
-                        config.BROKER_CREDENTIALS[broker][k] = _dec(v)
+            # Restore fallback store if keyring is unavailable
+            if not _KEYRING_OK:
+                _FALLBACK_STORE.update(data.get("_fallback", {}))
+            # Migrate old base64 format if "credentials" key present
+            if "credentials" in data:
+                import base64 as _b64
+                for broker, creds in data["credentials"].items():
+                    if broker in config.BROKER_CREDENTIALS:
+                        for k, v in creds.items():
+                            try:
+                                plain = _b64.b64decode(v.encode()).decode() if v else ""
+                            except Exception:
+                                plain = v
+                            if plain:
+                                _save_secret(f"{broker}_{k}", plain)
+                                config.BROKER_CREDENTIALS[broker][k] = plain
+                # Migrate telegram
+                tg = data.get("telegram", {})
+                _save_secret("telegram_bot_token", _b64.b64decode(tg.get("bot_token","").encode()).decode() if tg.get("bot_token") else "")
+                _save_secret("telegram_chat_id",   _b64.b64decode(tg.get("chat_id","").encode()).decode()   if tg.get("chat_id")   else "")
+                # Rewrite in new format
+                self._persist()
+            else:
+                # Normal load from keyring
+                for broker, keys in data.get("stored_keys", {}).items():
+                    if broker in config.BROKER_CREDENTIALS:
+                        for k in keys:
+                            v = _load_secret(f"{broker}_{k}")
+                            if v:
+                                config.BROKER_CREDENTIALS[broker][k] = v
+            config.TELEGRAM_BOT_TOKEN = _load_secret("telegram_bot_token")
+            config.TELEGRAM_CHAT_ID   = _load_secret("telegram_chat_id")
             tg = data.get("telegram", {})
-            config.TELEGRAM_BOT_TOKEN = _dec(tg.get("bot_token", ""))
-            config.TELEGRAM_CHAT_ID   = _dec(tg.get("chat_id",   ""))
             config.TELEGRAM_ENABLED   = tg.get("enabled", False)
             saved_broker = data.get("broker", "mock")
             if saved_broker in self.BROKERS:

@@ -242,5 +242,9 @@ class MarketRegimeDetector:
                 f"(trending={trending}, ranging={ranging}, volatile={volatile})"
             )
 
+        # Always store the regime label in features so downstream code can
+        # check regime == "TRENDING" explicitly without relying on key-presence tricks.
+        result.features["regime"] = result.regime
+
         logger.debug(f"MarketRegimeDetector: {result.reason}")
         return result

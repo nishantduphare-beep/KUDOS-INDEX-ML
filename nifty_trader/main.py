@@ -33,9 +33,10 @@ logger = logging.getLogger("main")
 
 
 def main():
+    import config as _cfg
     logger.info("=" * 60)
     logger.info("NiftyTrader Intelligence v2.0 — Starting")
-    logger.info(f"Broker: {os.getenv('BROKER', 'mock')}")
+    logger.info(f"Broker: {_cfg.BROKER}")
     logger.info("=" * 60)
 
     try:
@@ -79,7 +80,16 @@ def main():
             logger.info("Mock broker started automatically")
 
     logger.info("Application ready.")
-    sys.exit(app.exec())
+    exit_code = app.exec()
+
+    # Flush WAL to main DB file on clean shutdown
+    try:
+        from database.manager import get_db
+        get_db().close()
+    except Exception as _e:
+        logger.warning(f"DB close on exit failed: {_e}")
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

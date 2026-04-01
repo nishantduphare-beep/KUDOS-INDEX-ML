@@ -9,6 +9,7 @@ Setup:
 """
 
 import logging
+import time
 import requests
 from typing import Optional
 import config
@@ -33,26 +34,39 @@ class TelegramAlerter:
             logger.warning("Telegram credentials not configured")
             return False
 
-        try:
-            resp = requests.post(
-                self._url,
-                json={
-                    "chat_id": self.chat_id,
-                    "text": text,
-                    "parse_mode": parse_mode,
-                    "disable_web_page_preview": True,
-                },
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                logger.debug("Telegram message sent")
-                return True
-            else:
-                logger.error(f"Telegram error: {resp.status_code} {resp.text}")
-                return False
-        except Exception as e:
-            logger.error(f"Telegram send failed: {e}")
-            return False
+        # Exponential backoff: up to 3 attempts with 2s, 4s delays
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = requests.post(
+                    self._url,
+                    json={
+                        "chat_id": self.chat_id,
+                        "text": text,
+                        "parse_mode": parse_mode,
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    logger.debug("Telegram message sent")
+                    return True
+                elif resp.status_code == 429:
+                    # Telegram rate limit — honour retry_after if provided
+                    retry_after = resp.json().get("parameters", {}).get("retry_after", 2 ** attempt)
+                    logger.warning(f"Telegram 429 rate-limited; retrying after {retry_after}s (attempt {attempt}/{max_attempts})")
+                    time.sleep(retry_after)
+                else:
+                    logger.error(f"Telegram error: {resp.status_code} {resp.text} (attempt {attempt}/{max_attempts})")
+                    if attempt < max_attempts:
+                        time.sleep(2 ** attempt)
+            except Exception as e:
+                logger.error(f"Telegram send failed: {e} (attempt {attempt}/{max_attempts})")
+                if attempt < max_attempts:
+                    time.sleep(2 ** attempt)
+
+        logger.error("Telegram send failed after all retries")
+        return False
 
     def send_alert(self, alert_obj) -> bool:
         """Format and send a NiftyTrader alert."""

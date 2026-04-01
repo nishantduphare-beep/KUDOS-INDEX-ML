@@ -4,7 +4,7 @@ SQLAlchemy ORM models — full ML-ready schema.
 Tables: market_candles, option_chain_snapshots, engine_signals, alerts, trade_outcomes
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import (
     Column, Integer, Float, String, Boolean,
     DateTime, Text, JSON, ForeignKey, Index, create_engine
@@ -48,10 +48,11 @@ class MarketCandle(Base):
     volume_sma       = Column(Float)
     volume_ratio     = Column(Float)    # volume / volume_sma
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
-        Index("idx_candle_index_ts", "index_name", "timestamp"),
+        Index("idx_candle_index_ts",  "index_name", "timestamp"),
+        Index("idx_candle_is_futures", "is_futures"),
     )
 
     def to_dict(self):
@@ -78,7 +79,8 @@ class OptionChainSnapshot(Base):
     pcr            = Column(Float)           # Put-Call Ratio by OI
     pcr_volume     = Column(Float)           # PCR by volume
     max_pain       = Column(Float)
-    iv_rank        = Column(Float)           # 0-100 percentile
+    avg_atm_iv     = Column(Float)           # mean IV of ATM±2 strikes (for IV Rank history)
+    iv_rank        = Column(Float)           # 0-100 percentile (rolling 20-day)
 
     # OI changes vs previous snapshot
     call_oi_change = Column(Float)
@@ -91,7 +93,7 @@ class OptionChainSnapshot(Base):
     # Full chain data as JSON (strike-level detail)
     chain_data     = Column(JSON)            # [{strike, call_oi, put_oi, call_iv, put_iv, ...}]
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
         Index("idx_oc_index_ts", "index_name", "timestamp"),
@@ -122,10 +124,11 @@ class EngineSignal(Base):
     # Reasoning
     reason         = Column(Text)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
         Index("idx_engine_index_ts", "index_name", "timestamp", "engine_name"),
+        Index("idx_engine_ts",       "timestamp"),
     )
 
 
@@ -156,6 +159,9 @@ class Alert(Base):
     entry_reference      = Column(Float)
     stop_loss_reference  = Column(Float)
     target_reference     = Column(Float)
+    target1              = Column(Float)         # T1 option premium level
+    target2              = Column(Float)         # T2 option premium level
+    target3              = Column(Float)         # T3 option premium level
 
     # Outcome tracking (filled after trade)
     outcome            = Column(String(10))      # WIN / LOSS / NEUTRAL / NULL
@@ -172,10 +178,11 @@ class Alert(Base):
 
     raw_features       = Column(JSON)            # Full feature vector at signal time
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
-        Index("idx_alert_index_ts", "index_name", "timestamp"),
+        Index("idx_alert_index_ts",   "index_name", "timestamp"),
+        Index("idx_alert_type_ts",    "alert_type",  "timestamp"),   # fast filter by TRADE_SIGNAL
     )
 
 
@@ -271,11 +278,12 @@ class TradeOutcome(Base):
     post_sl_full_recovery      = Column(Boolean, default=False)  # SL hit → price later hit T3
 
     alert = relationship("Alert", backref="trade_outcomes")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
-        Index("idx_outcome_alert", "alert_id"),
-        Index("idx_outcome_status", "status"),
+        Index("idx_outcome_alert",       "alert_id"),
+        Index("idx_outcome_status",      "status"),
+        Index("idx_outcome_index_entry", "index_name", "entry_time"),
     )
 
 
@@ -296,7 +304,7 @@ class OptionPriceHistory(Base):
     pct_from_entry = Column(Float)                        # (ltp - entry) / entry * 100
     candle_num     = Column(Integer, default=0)           # 0=entry, 1=first candle, etc.
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
         Index("idx_oph_alert", "alert_id"),
@@ -393,6 +401,9 @@ class MLFeatureRecord(Base):
     label          = Column(Integer)    # 1 = valid move, 0 = false signal, -1 = unlabeled
     label_direction = Column(Integer)   # 1 = bullish, -1 = bearish, 0 = no move
     label_quality  = Column(Integer)    # -1=unlabeled, 0=SL_hit, 1=T1_hit, 2=T2_hit, 3=T3_hit
+    # Which priority was used when labeling (for data quality reporting)
+    # 1=TradeOutcome (real P&L), 2=CrossLink (nearby outcome), 3=OptionChain LTP, 4=ATR Heuristic
+    label_source   = Column(Integer, default=0)  # 0=unlabeled
 
     # Signal timing (for forming-candle and theta-decay features)
     candle_completion_pct = Column(Float)    # 0.0-1.0: how far into candle at signal time
@@ -463,6 +474,16 @@ class MLFeatureRecord(Base):
     index_encoded     = Column(Integer)   # 0=NIFTY,1=BANKNIFTY,2=MIDCPNIFTY,3=SENSEX,4=other
     is_trade_signal   = Column(Integer)   # 0=EARLY_MOVE, 1=TRADE_SIGNAL
 
+    # Group I: Historical performance context (added for richer ML learning)
+    # Rolling 20-trade win rate for the best-matched named setup at signal time (0-100).
+    # 0.0 means no setup matched or no history yet. Model learns to discount
+    # setups that fire often but rarely result in wins.
+    setup_win_rate     = Column(Float, default=0.0)
+    # Minutes since the last TRADE_SIGNAL on the same index (any direction).
+    # Short gaps (< 5 min) = potential over-signaling / low conviction.
+    # Long gaps (> 60 min) = fresh opportunity after consolidation.
+    mins_since_last_signal = Column(Float, default=0.0)
+
     # Outcome feedback (populated by OutcomeTracker when trade closes)
     sl_hit             = Column(Boolean)
     t1_hit             = Column(Boolean)
@@ -476,7 +497,7 @@ class MLFeatureRecord(Base):
     post_sl_full_recovery = Column(Boolean)  # SL hit but price later hit T3
     post_close_max_fav_atr= Column(Float)    # best move AFTER close (ATR units)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
         Index("idx_ml_index_label_ts", "index_name", "label", "timestamp"),
@@ -525,7 +546,7 @@ class SetupAlert(Base):
     sl_hit        = Column(Boolean, default=False)
     realized_pnl  = Column(Float,   default=0.0)  # actual P&L at close in ₹
 
-    created_at    = Column(DateTime, default=datetime.utcnow)
+    created_at    = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
         Index("idx_setup_alerts_index_ts",   "index_name", "timestamp"),
@@ -610,7 +631,7 @@ class S11PaperTrade(Base):
     # Realized P&L in rupees (2 lots, actual exit price used)
     realized_pnl    = Column(Float, default=0.0)
 
-    created_at      = Column(DateTime, default=datetime.utcnow)
+    created_at      = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
         Index("idx_s11_index_date",  "index_name", "date"),
@@ -652,9 +673,53 @@ class OptionEODPrice(Base):
     put_iv        = Column(Float, default=0.0)
     put_volume    = Column(Float, default=0.0)
 
-    created_at    = Column(DateTime, default=datetime.utcnow)
+    # Greeks (Black-Scholes, computed at collection time)
+    delta_call    = Column(Float, default=0.0)
+    gamma_call    = Column(Float, default=0.0)
+    theta_call    = Column(Float, default=0.0)
+    vega_call     = Column(Float, default=0.0)
+    delta_put     = Column(Float, default=0.0)
+    gamma_put     = Column(Float, default=0.0)
+    theta_put     = Column(Float, default=0.0)
+    vega_put      = Column(Float, default=0.0)
+
+    # Second-expiry flag (True when this row belongs to next weekly/monthly chain)
+    is_next_expiry = Column(Boolean, default=False)
+
+    created_at    = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
         Index("idx_eod_index_ts",     "index_name", "timestamp"),
         Index("idx_eod_strike_ts",    "index_name", "strike", "timestamp"),
+    )
+
+
+
+class AutoPaperTrade(Base):
+    """Persisted record of every paper/live auto-trade order placed by OrderManager."""
+    __tablename__ = "auto_paper_trades"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    order_id    = Column(String(30), unique=True, nullable=False)
+    alert_id    = Column(Integer, default=0)
+    index_name  = Column(String(20))
+    direction   = Column(String(10))
+    symbol      = Column(String(60))
+    qty         = Column(Integer, default=0)
+    entry       = Column(Float, default=0.0)
+    sl          = Column(Float, default=0.0)
+    tp          = Column(Float, default=0.0)
+    sl_opt      = Column(Float, default=0.0)
+    tp_opt      = Column(Float, default=0.0)
+    status      = Column(String(20), default="PAPER-OPEN")
+    pnl         = Column(Float, default=0.0)
+    mode        = Column(String(10), default="PAPER")
+    placed_at   = Column(DateTime)
+    closed_at   = Column(DateTime)
+    date        = Column(String(10))   # YYYY-MM-DD (IST)
+    created_at  = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        Index("idx_apt_date",     "date"),
+        Index("idx_apt_order_id", "order_id"),
     )

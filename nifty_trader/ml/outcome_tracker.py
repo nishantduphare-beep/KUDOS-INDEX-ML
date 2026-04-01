@@ -490,7 +490,12 @@ class OutcomeTracker:
                 realized_pnl      = realized_pnl,
             )
         except Exception as e:
-            logger.error(f"OutcomeTracker DB write error: {e}")
+            # DB write failed — leave trade in _open so it retries next tick.
+            # Do NOT remove from memory; losing it here would orphan the trade entirely.
+            logger.error(
+                f"OutcomeTracker DB write error (trade kept open for retry): {e}"
+            )
+            return
 
         del self._open[outcome_id]
 

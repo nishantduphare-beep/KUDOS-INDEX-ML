@@ -86,12 +86,20 @@ class OptionStrike:
     call_volume:     float = 0
     call_iv:         float = 0.0
     call_ltp:        float = 0.0
+    call_delta:      float = 0.0
+    call_gamma:      float = 0.0
+    call_theta:      float = 0.0
+    call_vega:       float = 0.0
 
     put_oi:          float = 0
     put_oi_change:   float = 0
     put_volume:      float = 0
     put_iv:          float = 0.0
     put_ltp:         float = 0.0
+    put_delta:       float = 0.0
+    put_gamma:       float = 0.0
+    put_theta:       float = 0.0
+    put_vega:        float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -102,11 +110,19 @@ class OptionStrike:
             "call_volume":    self.call_volume,
             "call_iv":        self.call_iv,
             "call_ltp":       self.call_ltp,
+            "call_delta":     self.call_delta,
+            "call_gamma":     self.call_gamma,
+            "call_theta":     self.call_theta,
+            "call_vega":      self.call_vega,
             "put_oi":         self.put_oi,
             "put_oi_change":  self.put_oi_change,
             "put_volume":     self.put_volume,
             "put_iv":         self.put_iv,
             "put_ltp":        self.put_ltp,
+            "put_delta":      self.put_delta,
+            "put_gamma":      self.put_gamma,
+            "put_theta":      self.put_theta,
+            "put_vega":       self.put_vega,
         }
 
 
@@ -116,11 +132,13 @@ class OptionStrike:
 
 @dataclass
 class OptionChain:
-    index_name:  str
-    spot_price:  float
-    expiry:      str
-    strikes:     List[OptionStrike]
-    timestamp:   datetime = field(default_factory=datetime.now)
+    index_name:       str
+    spot_price:       float
+    expiry:           str
+    strikes:          List[OptionStrike]
+    timestamp:        datetime = field(default_factory=datetime.now)
+    next_expiry:      str = ""   # second-nearest expiry label, e.g. "03APR2025"
+    next_expiry_unix: int = 0    # second-nearest expiry unix timestamp from broker
 
     # ── ATM ───────────────────────────────────────────────────────
     @property

@@ -1,6 +1,6 @@
 """
 engines/vwap_pressure.py
-Engine 7 — VWAP Pressure (Institutional Anchor)
+Engine 9 — VWAP Pressure (Institutional Anchor)
 
 VWAP (Volume Weighted Average Price) resets at 9:15 AM each day.
 It is the single most-watched intraday level by institutional desks.
@@ -30,10 +30,10 @@ import config
 logger = logging.getLogger(__name__)
 
 # Proximity threshold to count as "touching" VWAP (fraction of ATR)
-VWAP_TOUCH_ATR_MULT  = 0.5   # within 0.5×ATR counts as a VWAP touch
-VWAP_TOUCH_PCT_MIN   = 0.003  # minimum 0.3% band (for low-ATR environments)
-VWAP_BODY_MIN_RATIO  = 0.35   # candle body must be at least 35% of range
-VWAP_VOL_RATIO_MIN   = 1.2    # volume must be 1.2× average
+VWAP_TOUCH_ATR_MULT  = config.VWAP_TOUCH_ATR_MULT
+VWAP_TOUCH_PCT_MIN   = config.VWAP_TOUCH_PCT_MIN
+VWAP_BODY_MIN_RATIO  = config.VWAP_BODY_MIN_RATIO
+VWAP_VOL_RATIO_MIN   = config.VWAP_VOL_RATIO_MIN
 
 
 @dataclass
@@ -53,7 +53,7 @@ class VWAPResult:
 
 class VWAPPressureDetector:
     """
-    Engine 7: VWAP-based institutional pressure detection.
+    Engine 9: VWAP-based institutional pressure detection.
 
     VWAP is computed fresh from today's session candles on every call.
     No external VWAP feed needed — calculated from open/high/low/close/volume.

@@ -87,7 +87,7 @@ class CompressionDetector:
             atr_values = atr_series.values
             # ATR is declining if each value < previous
             atr_declining = all(
-                atr_values[i] <= atr_values[i - 1]
+                atr_values[i] < atr_values[i - 1]
                 for i in range(1, len(atr_values))
             )
             atr_slope = (atr_values[-1] - atr_values[0]) / max(atr_values[0], 1)
@@ -141,28 +141,3 @@ class CompressionDetector:
         logger.debug(f"CompressionDetector: {result.reason}")
         return result
 
-    def detect_breakout(self, df: pd.DataFrame, prev_result: CompressionResult) -> bool:
-        """
-        After a compression phase, detect if breakout has started.
-        Used by SignalAggregator to confirm a trade signal.
-        """
-        if not prev_result.is_triggered or df is None or len(df) < 2:
-            return False
-
-        last_candle  = df.iloc[-1]
-        prev_candle  = df.iloc[-2]
-        atr          = float(last_candle.get("atr", 0))
-
-        # Breakout: candle range > ATR * multiplier
-        candle_range = last_candle["high"] - last_candle["low"]
-        breakout_threshold = atr * config.BREAKOUT_ATR_MULTIPLIER
-
-        # Volume surge
-        volume_ratio = float(last_candle.get("volume_ratio", 1.0))
-        volume_surge = volume_ratio >= config.VOLUME_SPIKE_MULTIPLIER
-
-        is_breakout = candle_range > breakout_threshold and volume_surge
-        if is_breakout:
-            logger.info(f"Breakout detected from compression: "
-                        f"range={candle_range:.2f} > threshold={breakout_threshold:.2f}")
-        return is_breakout

@@ -186,7 +186,7 @@ class S11Tab(QWidget):
     """
 
     _EARLY_HEADERS = ["Time", "Index", "Direction", "Spot", "Conf%", "Engines"]
-    _OPEN_HEADERS  = ["Index", "Dir", "Entry Spot", "Entry ₹", "SL (spot)",
+    _OPEN_HEADERS  = ["Time", "Index", "Dir", "Entry Spot", "Entry ₹", "SL (spot)",
                       "T1", "T2", "T3", "Units", "P&L@T2 ₹", "T1?", "T2?"]
     _CLOSED_HEADERS = ["Time", "Index", "Dir", "Entry ₹", "Exit ₹",
                        "Reason", "Outcome", "P&L ₹"]
@@ -279,24 +279,28 @@ class S11Tab(QWidget):
             # Row highlight if T2 already trailed
             bg = "#1a2a1a" if t2_hit else ("#1a1a2a" if t1_hit else None)
 
-            self._open_tbl.setItem(r, 0,  _item(p.get("index_name", ""), bold=True, bg=bg))
-            self._open_tbl.setItem(r, 1,  _item(p.get("direction",  ""), color=dc,  bold=True, bg=bg))
-            self._open_tbl.setItem(r, 2,  _item(f"{p.get('entry_spot',  0):.0f}", bg=bg))
-            self._open_tbl.setItem(r, 3,  _item(f"{p.get('entry_price', 0):.2f}", bg=bg))
-            self._open_tbl.setItem(r, 4,  _item(f"{p.get('spot_sl',  0):.0f}", color="#f85149", bg=bg))
-            self._open_tbl.setItem(r, 5,  _item(f"{p.get('spot_t1', 0):.0f}", bg=bg))
-            self._open_tbl.setItem(r, 6,  _item(f"{p.get('spot_t2', 0):.0f}", bg=bg))
-            self._open_tbl.setItem(r, 7,  _item(f"{p.get('spot_t3', 0):.0f}", bg=bg))
-            self._open_tbl.setItem(r, 8,  _item(str(p.get("units", 0)), bg=bg))
+            et = p.get("entry_time", "")
+            et_str = et.strftime("%H:%M:%S") if isinstance(et, datetime) else str(et)[:8]
+
+            self._open_tbl.setItem(r, 0,  _item(et_str, bg=bg))
+            self._open_tbl.setItem(r, 1,  _item(p.get("index_name", ""), bold=True, bg=bg))
+            self._open_tbl.setItem(r, 2,  _item(p.get("direction",  ""), color=dc,  bold=True, bg=bg))
+            self._open_tbl.setItem(r, 3,  _item(f"{p.get('entry_spot',  0):.0f}", bg=bg))
+            self._open_tbl.setItem(r, 4,  _item(f"{p.get('entry_price', 0):.2f}", bg=bg))
+            self._open_tbl.setItem(r, 5,  _item(f"{p.get('spot_sl',  0):.0f}", color="#f85149", bg=bg))
+            self._open_tbl.setItem(r, 6,  _item(f"{p.get('spot_t1', 0):.0f}", bg=bg))
+            self._open_tbl.setItem(r, 7,  _item(f"{p.get('spot_t2', 0):.0f}", bg=bg))
+            self._open_tbl.setItem(r, 8,  _item(f"{p.get('spot_t3', 0):.0f}", bg=bg))
+            self._open_tbl.setItem(r, 9,  _item(str(p.get("units", 0)), bg=bg))
             pnl_t2 = p.get("pnl_at_t2", 0)
-            self._open_tbl.setItem(r, 9,  _item(
+            self._open_tbl.setItem(r, 10, _item(
                 f"₹{pnl_t2:+,.0f}",
                 color="#3fb950" if pnl_t2 >= 0 else "#f85149",
                 bold=True, bg=bg,
             ))
-            self._open_tbl.setItem(r, 10, _item("✓" if t1_hit else "·",
+            self._open_tbl.setItem(r, 11, _item("✓" if t1_hit else "·",
                                                  color="#3fb950" if t1_hit else "#8b949e", bg=bg))
-            self._open_tbl.setItem(r, 11, _item("✓" if t2_hit else "·",
+            self._open_tbl.setItem(r, 12, _item("✓" if t2_hit else "·",
                                                  color="#3fb950" if t2_hit else "#8b949e", bg=bg))
 
     def _refresh_closed(self) -> None:

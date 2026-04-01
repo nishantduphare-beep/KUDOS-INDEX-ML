@@ -43,6 +43,7 @@ FEATURE_COLUMNS = [
 
     # Engine 5: Liquidity Trap
     "liq_wick_ratio", "liq_volume_ratio",
+    "sweep_up", "sweep_down", "is_small_candle",   # binary trap context
 
     # Engine 6: Gamma Levels
     "dist_to_gamma_wall", "dist_to_call_wall", "dist_to_put_wall",
@@ -115,6 +116,10 @@ FEATURE_COLUMNS = [
     "direction_encoded",   # 1=BULLISH, -1=BEARISH
     "index_encoded",       # 0=NIFTY, 1=BANKNIFTY, 2=MIDCPNIFTY, 3=SENSEX
     "is_trade_signal",     # 0=EARLY_MOVE, 1=TRADE_SIGNAL
+
+    # Group I: Historical performance context
+    "setup_win_rate",          # rolling 20-trade win rate for best-matched setup (0-100)
+    "mins_since_last_signal",  # minutes since last TRADE_SIGNAL on same index
 ]
 
 TARGET_COLUMN = "label"           # 1 = valid move, 0 = false signal

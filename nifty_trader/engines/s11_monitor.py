@@ -46,8 +46,8 @@ from database.manager import DatabaseManager
 logger = logging.getLogger(__name__)
 _IST = config.IST
 
-# S11 condition thresholds
-_S11_VOLUME_RATIO_MIN = 1.5
+# S11 condition thresholds (configured in config.py)
+_S11_VOLUME_RATIO_MIN = config.S11_VOLUME_RATIO_MIN
 _S11_REGIME_REQUIRED  = "TRENDING"
 
 # Level tracking key prefix
@@ -122,8 +122,7 @@ class S11Monitor:
         Volume    : volume_ratio >= 1.5
         """
         regime_f = raw.get("market_regime", {}) or {}
-        # trend_strength key is written only when regime is TRENDING
-        if "trend_strength" not in regime_f:
+        if regime_f.get("regime") != _S11_REGIME_REQUIRED:
             return False
 
         vol_f        = raw.get("volume_pressure", {}) or {}
@@ -194,11 +193,10 @@ class S11Monitor:
             cm  = _candle_min(ts)
             key = (getattr(alert_obj, "index_name", ""), direction, cm)
             with self._lock:
-                already = key in self._seen_confirmed
-            if not already:
-                with self._lock:
-                    self._seen_confirmed.add(key)
-                self._open_paper(alert_obj)
+                if key in self._seen_confirmed:
+                    return
+                self._seen_confirmed.add(key)
+            self._open_paper(alert_obj)
 
     # ─── Paper Position Open ──────────────────────────────────────
 
@@ -289,7 +287,7 @@ class S11Monitor:
             "mfe_atr":         0.0,
             "mae_atr":         0.0,
             "status":          "OPEN",
-            "created_at":      datetime.utcnow(),
+            "created_at":      datetime.now(),
         }
 
         try:
@@ -318,7 +316,8 @@ class S11Monitor:
             "t2_price":    t2_price,
             "t3_price":    t3_price,
             # Dynamic SL (trails to breakeven after T2)
-            "current_sl":  spot_sl,
+            "current_sl":     spot_sl,
+            "current_sl_opt": sl_price,   # option SL level, trails to entry_price after T2
             # Level hit state
             "t1_hit":      False,
             "t2_hit":      False,
@@ -387,7 +386,7 @@ class S11Monitor:
                     self._close_paper(
                         trade_id, state, spot, "EOD",
                         exit_price=opt_price or 0.0,
-                        exit_spot=spot, now=now,
+                        now=now,
                     )
                     closed.append(trade_id)
                     continue
@@ -397,7 +396,7 @@ class S11Monitor:
                     self._close_paper(
                         trade_id, state, spot, reason,
                         exit_price=opt_price or 0.0,
-                        exit_spot=spot, now=now,
+                        now=now,
                     )
                     closed.append(trade_id)
 
@@ -412,14 +411,29 @@ class S11Monitor:
         """
         Returns (done: bool, reason: str).
         Mutates state for t1_hit / t2_hit and current_sl trail.
-        All level detection is on SPOT price.
-        Stores actual option LTP (opt_price) at T1/T2 hit time for real P&L.
+
+        Level detection priority:
+          - When live option LTP is available  → use option price levels
+            (sl_price, t1_price, t2_price, t3_price from signal)
+          - When option LTP is unavailable      → fall back to spot levels
+            (spot_sl, spot_t1, spot_t2, spot_t3)
+
+        SL trail after T2: option entry_price (breakeven on premium paid).
         """
-        bull = (state["direction"] == "BULLISH")
+        bull      = (state["direction"] == "BULLISH")
+        use_opt   = (opt_price is not None and opt_price > 0
+                     and state.get("entry_price", 0) > 0)
+
+        # ── helpers: pick option level or spot level ──────────────
+        def _t3(): return state["t3_price"] if use_opt else state["spot_t3"]
+        def _t2(): return state["t2_price"] if use_opt else state["spot_t2"]
+        def _t1(): return state["t1_price"] if use_opt else state["spot_t1"]
+
+        # price used for comparison
+        price = opt_price if use_opt else spot
 
         # T3 → close WIN
-        t3_spot = state["spot_t3"]
-        if (bull and spot >= t3_spot) or (not bull and spot <= t3_spot):
+        if (bull and price >= _t3()) or (not bull and price <= _t3()):
             if not state["t3_hit"]:
                 state["t3_hit"] = True
                 try:
@@ -430,15 +444,14 @@ class S11Monitor:
                     pass
             return True, "T3"
 
-        # T2 → milestone + trail SL to breakeven + capture live LTP
-        t2_spot = state["spot_t2"]
-        if (bull and spot >= t2_spot) or (not bull and spot <= t2_spot):
+        # T2 → milestone + trail SL to entry premium (breakeven) + capture LTP
+        if (bull and price >= _t2()) or (not bull and price <= _t2()):
             if not state["t2_hit"]:
-                state["t2_hit"]          = True
-                state["current_sl"]      = state["entry_spot"]   # trail to breakeven
-                # Store actual option LTP at T2 — used for real P&L on SL-after-T2
-                if opt_price and opt_price > 0:
-                    state["t2_actual_ltp"] = opt_price
+                state["t2_hit"]        = True
+                state["t2_actual_ltp"] = opt_price if use_opt else state["t2_price"]
+                # Trail SL: option → entry_price (breakeven); spot → entry_spot
+                state["current_sl_opt"] = state["entry_price"]
+                state["current_sl"]     = state["entry_spot"]
                 try:
                     self._db.update_s11_paper_trade(state["trade_id"], {
                         "t2_hit": True, "t2_hit_time": now,
@@ -447,18 +460,15 @@ class S11Monitor:
                     pass
                 logger.info(
                     f"S11 T2 hit [{state['index_name']}] {state['direction']} "
-                    f"spot={spot:.0f} opt={opt_price or 0:.2f} "
-                    f"— SL trailed to entry {state['entry_spot']:.0f}"
+                    f"opt={opt_price or 0:.2f} spot={spot:.0f} "
+                    f"— SL trailed to entry premium {state['entry_price']:.2f}"
                 )
 
-        # T1 → milestone + capture live LTP
-        t1_spot = state["spot_t1"]
-        if (bull and spot >= t1_spot) or (not bull and spot <= t1_spot):
+        # T1 → milestone + capture LTP
+        if (bull and price >= _t1()) or (not bull and price <= _t1()):
             if not state["t1_hit"]:
-                state["t1_hit"] = True
-                # Store actual option LTP at T1 — used for real P&L on EOD-after-T1
-                if opt_price and opt_price > 0:
-                    state["t1_actual_ltp"] = opt_price
+                state["t1_hit"]        = True
+                state["t1_actual_ltp"] = opt_price if use_opt else state["t1_price"]
                 try:
                     self._db.update_s11_paper_trade(state["trade_id"], {
                         "t1_hit": True, "t1_hit_time": now,
@@ -466,10 +476,16 @@ class S11Monitor:
                 except Exception:
                     pass
 
-        # SL hit (uses current_sl which may have trailed to breakeven)
-        cur_sl = state["current_sl"]
-        if (bull and spot <= cur_sl) or (not bull and spot >= cur_sl):
-            return True, "SL"
+        # SL hit — use option SL level when available; else spot SL
+        if use_opt:
+            # After T2, SL trails to entry_price (breakeven)
+            cur_sl_opt = state.get("current_sl_opt", state["sl_price"])
+            if (bull and opt_price <= cur_sl_opt) or (not bull and opt_price >= cur_sl_opt):
+                return True, "SL"
+        else:
+            cur_sl = state["current_sl"]
+            if (bull and spot <= cur_sl) or (not bull and spot >= cur_sl):
+                return True, "SL"
 
         return False, ""
 
@@ -525,34 +541,30 @@ class S11Monitor:
         t2_ltp = state.get("t2_actual_ltp") or state["t2_price"]
 
         if reason == "T3":
-            outcome = "WIN"
-            # exit_price = live LTP at the moment T3 spot level was hit
             pnl = round((exit_price - ep) * units, 2) if ep > 0 else 0.0
+            outcome = "WIN" if pnl > 0 else "LOSS"
 
         elif reason == "SL":
             if t2_hit:
                 # 50% booked at T2 (t2_ltp), 50% exits now at exit_price
-                outcome = "WIN"
                 pnl = (
                     round((t2_ltp    - ep) * units * 0.5, 2)
                   + round((exit_price - ep) * units * 0.5, 2)
                 ) if ep > 0 else 0.0
             else:
-                # Full loss — exit_price = live LTP at SL spot level hit
-                outcome = "LOSS"
                 pnl = round((exit_price - ep) * units, 2) if ep > 0 else 0.0
+            outcome = "WIN" if pnl > 0 else "LOSS"
 
         elif reason == "EOD":
             if t1_hit:
                 # 50% booked at T1 (t1_ltp), 50% exits at EOD LTP
-                outcome = "WIN"
                 pnl = (
                     round((t1_ltp    - ep) * units * 0.5, 2)
                   + round((exit_price - ep) * units * 0.5, 2)
                 ) if ep > 0 else 0.0
             else:
-                outcome = "NEUTRAL"
                 pnl = round((exit_price - ep) * units, 2) if ep > 0 else 0.0
+            outcome = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "NEUTRAL")
 
         else:
             outcome = "NEUTRAL"
@@ -663,7 +675,8 @@ class S11Monitor:
                 "t1_price":    row.t1_price,
                 "t2_price":    row.t2_price,
                 "t3_price":    row.t3_price,
-                "current_sl":  row.entry_spot if row.t2_hit else row.spot_sl,
+                "current_sl":     row.entry_spot if row.t2_hit else row.spot_sl,
+                "current_sl_opt": row.entry_price if row.t2_hit else row.sl_price,
                 "t1_hit":      bool(row.t1_hit),
                 "t2_hit":      bool(row.t2_hit),
                 "t3_hit":      bool(row.t3_hit) if row.t3_hit is not None else False,
@@ -689,16 +702,52 @@ class S11Monitor:
         if open_rows:
             logger.info(f"S11Monitor: rehydrated {len(open_rows)} open position(s)")
 
+        # Also reload today's CLOSED trades so the UI shows them after restart
+        try:
+            today_str  = datetime.now(_IST).strftime("%Y-%m-%d")
+            all_today  = self._db.get_s11_trades_by_date(today_str)
+            closed_rows = [r for r in all_today if r.status == "CLOSED"]
+            for row in closed_rows:
+                closed_rec = {
+                    "trade_id":    row.id,
+                    "index_name":  row.index_name,
+                    "direction":   row.direction,
+                    "entry_time":  row.entry_time,
+                    "entry_spot":  row.entry_spot,
+                    "entry_price": row.entry_price,
+                    "exit_price":  row.exit_price or 0.0,
+                    "exit_spot":   row.exit_spot  or 0.0,
+                    "exit_reason": row.exit_reason or "",
+                    "outcome":     row.outcome    or "NEUTRAL",
+                    "realized_pnl": row.realized_pnl or 0.0,
+                    "t1_hit":      bool(row.t1_hit),
+                    "t2_hit":      bool(row.t2_hit),
+                    "units":       row.units,
+                    "lots":        row.lots,
+                }
+                self._closed_today.append(closed_rec)
+                # Also mark confirmed dedup so same candle can't reopen
+                cm  = _candle_min(row.entry_time)
+                key = (row.index_name, row.direction, cm)
+                self._seen_confirmed.add(key)
+            if closed_rows:
+                logger.info(f"S11Monitor: rehydrated {len(closed_rows)} closed trade(s) for today")
+        except Exception as exc:
+            logger.warning(f"S11Monitor rehydrate closed: {exc}")
+
     # ─── EOD helper ───────────────────────────────────────────────
 
-    def eod_close_all(self, spot_prices: Dict[str, float]) -> None:
+    def eod_close_all(
+        self,
+        spot_prices: Dict[str, float],
+        option_ltps: Optional[Dict[str, float]] = None,
+    ) -> None:
         """
         Force-close all remaining open positions at EOD (15:30).
         Called from main_window when the market closes.
-        Wraps tick() with is_eod forced True by passing 15:31 internally —
-        easier to just call tick() after 15:30 since it auto-detects EOD.
+        Passes option_ltps so exit P&L uses live option prices where available.
         """
-        self.tick(spot_prices)
+        self.tick(spot_prices, option_ltps)
 
 
 # ─── Helpers ─────────────────────────────────────────────────────

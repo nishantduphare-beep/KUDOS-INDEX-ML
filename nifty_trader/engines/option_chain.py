@@ -120,7 +120,7 @@ class OptionChainDetector:
         # Normalize OI changes relative to existing OI.
         # Guard: if absolute ATM OI is too small (thin market), relative %
         # would be noise — treat as zero change to avoid false signals.
-        _MIN_ATM_OI = 50_000
+        _MIN_ATM_OI = config.OC_MIN_ATM_OI
         rel_call_ch = (call_oi_ch / max(atm_call_oi, 1)
                        if atm_call_oi >= _MIN_ATM_OI else 0.0)
         rel_put_ch  = (put_oi_ch  / max(atm_put_oi,  1)

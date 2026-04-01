@@ -29,6 +29,75 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────
+# CIRCUIT BREAKER
+# ──────────────────────────────────────────────────────────────────
+
+class _CircuitBreaker:
+    """
+    Simple circuit breaker for broker API calls.
+
+    States:
+      CLOSED  — normal operation, calls pass through
+      OPEN    — too many failures; calls are blocked for `reset_timeout` seconds
+      HALF    — one probe call allowed after timeout; success → CLOSED, fail → OPEN
+
+    Usage:
+        _cb = _CircuitBreaker(fail_threshold=5, reset_timeout=60)
+        if _cb.allow():
+            try:
+                result = broker_call()
+                _cb.success()
+            except Exception:
+                _cb.failure()
+    """
+
+    _CLOSED = "CLOSED"
+    _OPEN   = "OPEN"
+    _HALF   = "HALF"
+
+    def __init__(self, fail_threshold: int = 5, reset_timeout: float = 60.0):
+        self._threshold    = fail_threshold
+        self._reset_timeout = reset_timeout
+        self._failures     = 0
+        self._state        = self._CLOSED
+        self._opened_at    = 0.0
+        self._lock         = threading.Lock()
+
+    def allow(self) -> bool:
+        with self._lock:
+            if self._state == self._CLOSED:
+                return True
+            if self._state == self._OPEN:
+                if time.monotonic() - self._opened_at >= self._reset_timeout:
+                    self._state = self._HALF
+                    return True   # probe call
+                return False
+            # HALF — allow the one probe call
+            return True
+
+    def success(self):
+        with self._lock:
+            self._failures = 0
+            self._state    = self._CLOSED
+
+    def failure(self):
+        with self._lock:
+            self._failures += 1
+            if self._state == self._HALF or self._failures >= self._threshold:
+                if self._state != self._OPEN:
+                    logger.warning(
+                        f"CircuitBreaker OPEN after {self._failures} consecutive broker failures. "
+                        f"Pausing API calls for {self._reset_timeout}s."
+                    )
+                self._state     = self._OPEN
+                self._opened_at = time.monotonic()
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+
+# ──────────────────────────────────────────────────────────────────
 # INDEX STATE
 # ──────────────────────────────────────────────────────────────────
 
@@ -281,6 +350,14 @@ class DataManager:
 
         # Option EOD price collection throttle — save at most once per minute per index
         self._last_eod_price_save: Dict[str, datetime] = {}
+        # EOD snapshot at 15:29 IST — track per-index so we capture exactly once per day
+        self._eod_snap_done: Dict[str, bool] = {}
+        # EOD data audit at 15:31 IST — run once per day in background thread
+        self._eod_audit_done: bool = False
+        self._eod_audit_thread = None
+
+        # Circuit breaker — opens after 5 consecutive broker failures; resets after 60s
+        self._broker_cb = _CircuitBreaker(fail_threshold=5, reset_timeout=60.0)
 
     # ─── Public API ───────────────────────────────────────────────
 
@@ -334,16 +411,46 @@ class DataManager:
                 )
                 self._states[idx].update_candles_5m(candles_5m)
                 self._states[idx].update_candles_15m(candles_15m)
-                # Use pre-fetched batch spot; fallback to latest candle close
+                # ── Bootstrap spot price — 3-level fallback chain ──────────────
+                # WHY this order matters (do not reorder or simplify):
+                #
+                # Level 1: batch quotes API (boot_spots) — most accurate, real-time.
+                #          Can fail with HTTP 429 pre-market (Fyers rate-limits before
+                #          9:00 AM) or return 0 if the broker hasn't populated prices yet.
+                #
+                # Level 2: prev_day_close — NSE official close from broker API.
+                #          Preferred outside 9:15–15:30 because the candle "close" (Level 3)
+                #          is actually the lp (last tick at 3:30 PM), which can be 30–50
+                #          points away from the official VWAP-based close. Using lp
+                #          pre-market causes the dashboard to show a wrong price that
+                #          doesn't match Fyers watchlist or NSE website.
+                #          ⚠️  Fetch prev_close BEFORE checking boot_spots so it's always
+                #          available as a fallback regardless of quotes API success.
+                #
+                # Level 3: latest candle close — only used if Level 1 fails during live
+                #          hours (9:15–15:30), where lp ≈ actual price and prev_close
+                #          would be stale (yesterday's official close, not today's live).
+                #
+                # ⚠️  DO NOT collapse these levels into "spot or candle.close" —
+                #     that was the original bug: 429 → Level 1 fails → Level 3 fires
+                #     outside live hours → shows lp instead of official close.
+                # ───────────────────────────────────────────────────────────────────
+                prev_close = self._adapter.get_prev_day_close(idx)   # fetch first (always)
+                self._states[idx].prev_day_close = prev_close
                 spot = boot_spots.get(idx, 0.0)
                 if not spot or spot <= 0:
-                    state = self._states[idx]
-                    if state.df is not None and len(state.df) > 0:
-                        spot = float(state.df.iloc[-1]["close"])
-                        logger.info(f"Bootstrap {idx}: spot from API failed, using latest candle close {spot:.2f}")
+                    from datetime import time as _bt
+                    _now_t = datetime.now().time()
+                    _live  = _bt(9, 15) <= _now_t <= _bt(15, 30)
+                    if not _live and prev_close > 0:
+                        spot = prev_close                              # Level 2: official close
+                        logger.info(f"Bootstrap {idx}: spot from API failed, using prev_close {spot:.2f}")
+                    else:
+                        state = self._states[idx]
+                        if state.df is not None and len(state.df) > 0:
+                            spot = float(state.df.iloc[-1]["close"]) # Level 3: candle ltp
+                            logger.info(f"Bootstrap {idx}: spot from API failed, using latest candle close {spot:.2f}")
                 self._states[idx].update_spot(spot)
-                prev_close = self._adapter.get_prev_day_close(idx)
-                self._states[idx].prev_day_close = prev_close
                 logger.info(f"Bootstrap {idx}: {len(candles)} candles "
                             f"(futures_vol={'yes' if futures else 'no'}), "
                             f"5m={len(candles_5m)}, 15m={len(candles_15m)}, "
@@ -457,22 +564,65 @@ class DataManager:
         )
         while self._running:
             try:
+                # ── _market_active window: WHY 9:00 AM, not 9:15 AM ────────────
+                # NSE pre-open session runs 9:00–9:15 AM. During pre-open, Fyers
+                # DOES return valid quotes — futures have real buy/sell activity and
+                # we capture the preopen_gap_pct feature (futures LTP vs prev_close).
+                # Starting at 9:00 (not 9:15) lets us collect this pre-open data.
+                #
+                # WHY 15:35, not 15:30:
+                # NSE closing session runs 15:30–15:35 (price discovery auction).
+                # Extending to 15:35 ensures we capture the closing tick and final
+                # option chain snapshot before the post-market rate-limit kicks in.
+                #
+                # Outside 9:00–15:35: Fyers aggressively returns HTTP 429 for
+                # quotes() calls. The tick loop still runs every 5s (to stay alive
+                # and respond to reconnect requests), but API calls are skipped.
+                # Spot prices fall back to prev_day_close (set at bootstrap).
+                #
+                # ⚠️  DO NOT widen this window (e.g. to 8:00 AM) — 429s flood the
+                #     log and Fyers may temporarily suspend the app_id.
+                # ────────────────────────────────────────────────────────────────
+                import config as _cfg_chk
+                _chk_time = datetime.now(_cfg_chk.IST).time()
+                from datetime import time as _tck
+                _market_active = _tck(9, 0) <= _chk_time <= _tck(15, 35)
+
                 # ONE batch spot fetch for all indices to avoid rate limiting
+                # Circuit breaker skips the call when the broker is repeatedly failing.
                 all_spots = {}
-                if hasattr(self._adapter, "get_all_spot_prices"):
-                    all_spots = self._adapter.get_all_spot_prices()
-                elif hasattr(self._adapter, "get_spot_price"):
-                    # Non-Fyers adapter: call once per index (no rate limit concern)
-                    for idx in config.INDICES:
-                        all_spots[idx] = self._adapter.get_spot_price(idx)
+                if _market_active:
+                    if not self._broker_cb.allow():
+                        logger.debug(f"CircuitBreaker {self._broker_cb.state}: skipping spot fetch")
+                    elif hasattr(self._adapter, "get_all_spot_prices"):
+                        try:
+                            all_spots = self._adapter.get_all_spot_prices()
+                            self._broker_cb.success()
+                        except Exception as _spot_e:
+                            logger.warning(f"Spot prices fetch error: {_spot_e}")
+                            self._broker_cb.failure()
+                    elif hasattr(self._adapter, "get_spot_price"):
+                        # Non-Fyers adapter: call once per index (no rate limit concern)
+                        try:
+                            for idx in config.INDICES:
+                                all_spots[idx] = self._adapter.get_spot_price(idx)
+                            self._broker_cb.success()
+                        except Exception as _spot_e:
+                            logger.warning(f"Spot price fetch error: {_spot_e}")
+                            self._broker_cb.failure()
 
                 # Fetch real-time futures OI + price in one batch call (Fyers only)
                 all_futures_quotes: dict = {}
-                if hasattr(self._adapter, "get_all_futures_quotes"):
-                    try:
-                        all_futures_quotes = self._adapter.get_all_futures_quotes()
-                    except Exception as e:
-                        logger.warning(f"Futures quotes tick error: {e}")
+                if _market_active and hasattr(self._adapter, "get_all_futures_quotes"):
+                    if not self._broker_cb.allow():
+                        logger.debug("CircuitBreaker: skipping futures fetch")
+                    else:
+                        try:
+                            all_futures_quotes = self._adapter.get_all_futures_quotes()
+                            self._broker_cb.success()
+                        except Exception as e:
+                            logger.warning(f"Futures quotes tick error: {e}")
+                            self._broker_cb.failure()
 
                 # Fetch India VIX (Fyers only — best-effort)
                 if hasattr(self._adapter, "get_vix"):
@@ -488,15 +638,26 @@ class DataManager:
                 _now_ist = datetime.now(_cfg.IST)
                 _ist_time = _now_ist.time()
                 from datetime import time as _time_cls
-                _in_preopen = _time_cls(9, 0) <= _ist_time < _time_cls(9, 15)
+                _in_preopen = _time_cls(9, 0)  <= _ist_time < _time_cls(9, 15)
                 _at_open    = _time_cls(9, 15) <= _ist_time < _time_cls(9, 16)
+                _at_eod     = _time_cls(15, 29) <= _ist_time < _time_cls(15, 30)
+                _at_audit   = _time_cls(15, 31) <= _ist_time < _time_cls(15, 45)
+                # Reset EOD-done flags at start of next trading day
+                if _ist_time < _time_cls(9, 0):
+                    self._eod_snap_done.clear()
+                    self._eod_audit_done = False
 
+                _live_session = _time_cls(9, 15) <= _ist_time <= _time_cls(15, 30)
                 for idx in config.INDICES:
                     spot = all_spots.get(idx, 0.0)
-                    # Fallback: use latest candle close when broker quotes fail
+                    # Fallback when quotes API fails:
+                    #   live hours  → latest candle close (best real-time proxy)
+                    #   outside hrs → official prev_close (avoids LTP/close divergence)
                     if not spot or spot <= 0:
                         state = self._states[idx]
-                        if state.df is not None and len(state.df) > 0:
+                        if not _live_session and state.prev_day_close > 0:
+                            spot = state.prev_day_close
+                        elif state.df is not None and len(state.df) > 0:
                             spot = float(state.df.iloc[-1]["close"])
                     self._states[idx].update_spot(spot)
 
@@ -513,7 +674,21 @@ class DataManager:
                         if _at_open:
                             self._states[idx].lock_preopen_snapshot()
 
-                    if oc_counter % oc_every_n == 0:
+                    # Dedicated EOD snapshot at 15:29 IST (captures final option prices)
+                    if _at_eod and not self._eod_snap_done.get(idx, False):
+                        try:
+                            chain = self._adapter.get_option_chain(idx)
+                            self._states[idx].update_option_chain(chain)
+                            # Force-save ignoring throttle by clearing last-save timestamp
+                            self._last_eod_price_save.pop(idx, None)
+                            self._persist_oc_snapshot(idx, chain)
+                            self._refresh_expiry_cache(idx)
+                            self._eod_snap_done[idx] = True
+                            logger.info(f"EOD option snapshot captured [{idx}] at 15:29")
+                        except Exception as _eod_e:
+                            logger.warning(f"EOD snapshot failed [{idx}]: {_eod_e}")
+
+                    elif _market_active and oc_counter % oc_every_n == 0:
                         try:
                             chain = self._adapter.get_option_chain(idx)
                             self._states[idx].update_option_chain(chain)
@@ -521,6 +696,11 @@ class DataManager:
                             self._refresh_expiry_cache(idx)
                         except Exception as _oc_e:
                             logger.warning(f"OC fetch failed [{idx}]: {_oc_e} — using stale chain")
+
+                # EOD data audit at 15:31 IST — runs once, in a daemon thread
+                if _at_audit and not self._eod_audit_done:
+                    self._eod_audit_done = True
+                    self._launch_eod_audit()
 
                 oc_counter += 1
                 for cb in self._callbacks:
@@ -600,6 +780,19 @@ class DataManager:
 
     def _persist_oc_snapshot(self, idx: str, chain: OptionChain):
         try:
+            # Compute avg ATM IV (ATM ± 2 strikes) for IV Rank history
+            atm_strikes = chain.get_atm_strikes(2)
+            atm_ivs = []
+            for s in atm_strikes:
+                if s.call_iv > 0:
+                    atm_ivs.append(s.call_iv)
+                if s.put_iv > 0:
+                    atm_ivs.append(s.put_iv)
+            avg_atm_iv = round(sum(atm_ivs) / len(atm_ivs), 2) if atm_ivs else 0.0
+
+            # Compute IV Rank (0-100 percentile vs last 20 days)
+            iv_rank = self._db.get_iv_rank(idx, avg_atm_iv, lookback_days=20)
+
             snap = {
                 "index_name":    idx,
                 "timestamp":     chain.timestamp,
@@ -611,6 +804,8 @@ class DataManager:
                 "pcr":           float(chain.pcr),
                 "pcr_volume":    float(chain.pcr_volume),
                 "max_pain":      float(chain.max_pain),
+                "avg_atm_iv":    avg_atm_iv,
+                "iv_rank":       iv_rank,
                 "chain_data":    [s.to_dict() for s in chain.strikes],
             }
             self._db.save_option_snapshot(snap)
@@ -618,65 +813,85 @@ class DataManager:
             logger.debug(f"OC persist error [{idx}]: {e}")
 
         # Collect individual strike prices for EOD research (throttled to 1/min)
-        self._collect_option_eod_prices(idx, chain)
+        self._collect_option_eod_prices(idx, chain, is_next_expiry=False)
 
-    def _collect_option_eod_prices(self, idx: str, chain: OptionChain):
+        # Fetch and save second expiry chain if broker provided a next expiry timestamp
+        if chain.next_expiry_unix > 0 and hasattr(self._adapter, "get_option_chain"):
+            try:
+                next_chain = self._adapter.get_option_chain(idx, expiry_ts=chain.next_expiry_unix)
+                self._collect_option_eod_prices(idx, next_chain, is_next_expiry=True)
+            except Exception as e:
+                logger.debug(f"Second expiry chain fetch failed [{idx}]: {e}")
+
+    def _collect_option_eod_prices(self, idx: str, chain: OptionChain,
+                                     is_next_expiry: bool = False):
         """
-        Save ATM ± 5 strikes' CE and PE prices to option_eod_prices table.
-        Throttled to once per minute per index to avoid DB flooding.
-        Covers: ltp, oi, iv, volume for both CE and PE at each strike.
+        Save ATM ± 15 strikes' CE/PE prices (+ Greeks) to option_eod_prices table.
+        Throttled to once per minute per index (primary expiry only).
+        is_next_expiry — True when saving second-weekly/monthly expiry rows.
         """
         try:
             now = datetime.now()
-            last = self._last_eod_price_save.get(idx)
-            if last and (now - last).total_seconds() < 60:
-                return  # throttle — max once per minute per index
+
+            # Throttle — primary chain at most once per minute; next-expiry piggybacks same window
+            throttle_key = idx
+            if not is_next_expiry:
+                last = self._last_eod_price_save.get(throttle_key)
+                if last and (now - last).total_seconds() < 60:
+                    return
 
             if not chain or not chain.strikes:
                 return
 
-            atm   = chain.atm_strike
-            gap   = 1  # strike_gap is in chain units; use index in sorted list
+            atm = chain.atm_strike
 
             # Sort strikes and find ATM index
             sorted_strikes = sorted(chain.strikes, key=lambda s: s.strike)
             atm_values     = [s.strike for s in sorted_strikes]
-
-            # Find closest to ATM
             atm_idx = min(range(len(atm_values)), key=lambda i: abs(atm_values[i] - atm))
 
-            # Collect ATM ± 5 strikes
+            # Collect ATM ± 15 strikes
             rows = []
-            for offset in range(-5, 6):
+            for offset in range(-15, 16):
                 si = atm_idx + offset
                 if si < 0 or si >= len(sorted_strikes):
                     continue
                 s = sorted_strikes[si]
                 rows.append({
-                    "timestamp":     chain.timestamp,
-                    "index_name":    idx,
-                    "expiry":        chain.expiry,
-                    "spot_price":    float(chain.spot_price),
-                    "atm_strike":    float(atm),
-                    "strike":        float(s.strike),
-                    "strike_offset": offset,
-                    "call_ltp":      float(s.call_ltp),
-                    "call_oi":       float(s.call_oi),
-                    "call_iv":       float(s.call_iv),
-                    "call_volume":   float(s.call_volume),
-                    "put_ltp":       float(s.put_ltp),
-                    "put_oi":        float(s.put_oi),
-                    "put_iv":        float(s.put_iv),
-                    "put_volume":    float(s.put_volume),
-                    "created_at":    now,
+                    "timestamp":      chain.timestamp,
+                    "index_name":     idx,
+                    "expiry":         chain.expiry,
+                    "spot_price":     float(chain.spot_price),
+                    "atm_strike":     float(atm),
+                    "strike":         float(s.strike),
+                    "strike_offset":  offset,
+                    "call_ltp":       float(s.call_ltp),
+                    "call_oi":        float(s.call_oi),
+                    "call_iv":        float(s.call_iv),
+                    "call_volume":    float(s.call_volume),
+                    "put_ltp":        float(s.put_ltp),
+                    "put_oi":         float(s.put_oi),
+                    "put_iv":         float(s.put_iv),
+                    "put_volume":     float(s.put_volume),
+                    "delta_call":     float(s.call_delta),
+                    "gamma_call":     float(s.call_gamma),
+                    "theta_call":     float(s.call_theta),
+                    "vega_call":      float(s.call_vega),
+                    "delta_put":      float(s.put_delta),
+                    "gamma_put":      float(s.put_gamma),
+                    "theta_put":      float(s.put_theta),
+                    "vega_put":       float(s.put_vega),
+                    "is_next_expiry": is_next_expiry,
+                    "created_at":     now,
                 })
 
             if rows:
                 self._db.save_option_eod_prices(rows)
-                self._last_eod_price_save[idx] = now
+                if not is_next_expiry:
+                    self._last_eod_price_save[throttle_key] = now
                 logger.debug(
-                    f"OptionEOD [{idx}]: saved {len(rows)} strikes "
-                    f"(ATM={atm:.0f}, expiry={chain.expiry})"
+                    f"OptionEOD [{idx}]{'[NEXT]' if is_next_expiry else ''}: "
+                    f"saved {len(rows)} strikes (ATM={atm:.0f}, expiry={chain.expiry})"
                 )
         except Exception as e:
             logger.debug(f"OptionEOD collect error [{idx}]: {e}")
@@ -733,6 +948,34 @@ class DataManager:
         chain = self._states[idx].get_option_chain()
         if chain and chain.expiry:
             update_from_chain_expiry(idx, chain.expiry)
+
+    def _launch_eod_audit(self):
+        """
+        Spawn a daemon thread to run the EOD options data audit.
+        Non-blocking — tick loop continues while audit runs in the background.
+        """
+        import threading
+        if (self._eod_audit_thread is not None
+                and self._eod_audit_thread.is_alive()):
+            return   # already running
+
+        def _run():
+            try:
+                from data.eod_auditor import EODOptionsAuditor
+                auditor = EODOptionsAuditor(self._db, self._adapter)
+                report  = auditor.run()
+                logger.info(
+                    f"EOD Audit finished — status={report.get('status')} "
+                    f"issues={report.get('total_issues')}"
+                )
+            except Exception as e:
+                logger.error(f"EOD Audit thread error: {e}", exc_info=True)
+
+        self._eod_audit_thread = threading.Thread(
+            target=_run, daemon=True, name="eod-options-audit"
+        )
+        self._eod_audit_thread.start()
+        logger.info("EOD options data audit launched in background")
 
     def _run_daily_purge(self):
         """Purge old DB rows — at most once per calendar day."""

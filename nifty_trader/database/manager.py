@@ -48,11 +48,15 @@ logger = logging.getLogger(__name__)
 class DatabaseManager:
     """Thread-safe SQLite database manager."""
 
+    # Increment this whenever a new migration batch is added so we can
+    # detect stale databases and warn the user on startup.
+    SCHEMA_VERSION = 1
+
     def __init__(self, db_path: str = config.DB_PATH):
         from sqlalchemy import event as _sa_event
         self.engine = create_engine(
             f"sqlite:///{db_path}",
-            connect_args={"check_same_thread": False, "timeout": 30},
+            connect_args={"check_same_thread": False, "timeout": 60},
             echo=config.DB_ECHO
         )
         # Enable WAL mode + 30s busy timeout to prevent "database is locked" under concurrent writes
@@ -60,7 +64,8 @@ class DatabaseManager:
         def _set_sqlite_pragmas(dbapi_conn, _):
             cur = dbapi_conn.cursor()
             cur.execute("PRAGMA journal_mode=WAL")
-            cur.execute("PRAGMA busy_timeout=30000")
+            cur.execute("PRAGMA busy_timeout=60000")
+            cur.execute("PRAGMA foreign_keys=ON")
             cur.close()
         self.SessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=self.engine
@@ -70,6 +75,7 @@ class DatabaseManager:
     def _init_db(self):
         """Create all tables if they don't exist, then migrate new columns."""
         Base.metadata.create_all(bind=self.engine)
+        self._ensure_schema_version()
         self._migrate_ml_feature_store()
         self._migrate_market_candles()
         self._migrate_trade_outcomes()
@@ -78,8 +84,53 @@ class DatabaseManager:
         self._migrate_indexes()
         self._migrate_setup_alerts()
         self._migrate_option_eod_prices()
+        self._migrate_option_chain_snapshots()
         self._migrate_s11_paper_trades()
+        self._migrate_auto_paper_trades()
         logger.info("Database initialized")
+
+    def _ensure_schema_version(self):
+        """
+        Create the app_meta table and track the schema version integer.
+        Logs a warning if the DB was created by an older app build.
+        All migrations are additive so the app can still run — this is
+        informational, not a hard gate.
+        """
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS app_meta (
+                        key   VARCHAR(40) PRIMARY KEY,
+                        value VARCHAR(100)
+                    )
+                """))
+                row = conn.execute(
+                    text("SELECT value FROM app_meta WHERE key='schema_version'")
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        text("INSERT INTO app_meta(key, value) VALUES ('schema_version', :v)"),
+                        {"v": str(self.SCHEMA_VERSION)},
+                    )
+                    logger.info(f"DB: schema_version set to {self.SCHEMA_VERSION}")
+                else:
+                    stored = int(row[0])
+                    if stored < self.SCHEMA_VERSION:
+                        conn.execute(
+                            text("UPDATE app_meta SET value=:v WHERE key='schema_version'"),
+                            {"v": str(self.SCHEMA_VERSION)},
+                        )
+                        logger.info(
+                            f"DB: schema upgraded {stored} → {self.SCHEMA_VERSION}"
+                        )
+                    elif stored > self.SCHEMA_VERSION:
+                        logger.warning(
+                            f"DB schema_version={stored} is newer than this build "
+                            f"({self.SCHEMA_VERSION}). Consider upgrading the app."
+                        )
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"schema_version check failed: {e}")
 
     def _migrate_ml_feature_store(self):
         """Add any missing columns to ml_feature_store (idempotent)."""
@@ -181,6 +232,11 @@ class DatabaseManager:
             "vwap_triggered":   "BOOLEAN",
             # Better labeling — graded outcome quality
             "label_quality":    "INTEGER DEFAULT -1",
+            # Label source priority (1=TradeOutcome, 2=CrossLink, 3=OptionChain, 4=ATR)
+            "label_source":          "INTEGER DEFAULT 0",
+            # Historical performance context
+            "setup_win_rate":        "FLOAT DEFAULT 0.0",
+            "mins_since_last_signal":"FLOAT DEFAULT 0.0",
         }
         try:
             with self.engine.connect() as conn:
@@ -324,6 +380,28 @@ class DatabaseManager:
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_ml_index_label_ts "
             "ON ml_feature_store(index_name, label, timestamp)",
+            # Allows fast alert_type='TRADE_SIGNAL' + date range queries
+            "CREATE INDEX IF NOT EXISTS idx_alert_type_ts "
+            "ON alerts(alert_type, timestamp)",
+            # L5 additions — performance indexes for common query patterns
+            "CREATE INDEX IF NOT EXISTS idx_outcome_index_entry "
+            "ON trade_outcomes(index_name, entry_time)",
+            "CREATE INDEX IF NOT EXISTS idx_engine_ts "
+            "ON engine_signals(timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_candle_is_futures "
+            "ON market_candles(is_futures)",
+            # Fast candle lookups by index + time range (most common query pattern)
+            "CREATE INDEX IF NOT EXISTS idx_candles_idx_ts "
+            "ON market_candles(index_name, timestamp)",
+            # Fast ML feature lookup by alert
+            "CREATE INDEX IF NOT EXISTS idx_features_alert_idx "
+            "ON ml_feature_store(alert_id, index_name)",
+            # Fast open-trade queries
+            "CREATE INDEX IF NOT EXISTS idx_outcomes_open "
+            "ON trade_outcomes(status) WHERE status='OPEN'",
+            # Fast alert timestamp + signal_type queries
+            "CREATE INDEX IF NOT EXISTS idx_alerts_ts_sig "
+            "ON alerts(timestamp DESC, signal_type)",
         ]
         try:
             with self.engine.connect() as conn:
@@ -385,7 +463,7 @@ class DatabaseManager:
             logger.warning(f"setup_alerts migration: {e}")
 
     def _migrate_option_eod_prices(self):
-        """Create option_eod_prices table if it doesn't exist (idempotent)."""
+        """Create option_eod_prices table if missing; add new columns idempotently."""
         try:
             with self.engine.connect() as conn:
                 conn.execute(text("""
@@ -409,6 +487,28 @@ class DatabaseManager:
                         created_at    DATETIME
                     )
                 """))
+                # Add Greek + second-expiry columns to existing tables
+                existing = {
+                    row[1]
+                    for row in conn.execute(text("PRAGMA table_info(option_eod_prices)"))
+                }
+                new_cols = {
+                    "delta_call":     "FLOAT DEFAULT 0",
+                    "gamma_call":     "FLOAT DEFAULT 0",
+                    "theta_call":     "FLOAT DEFAULT 0",
+                    "vega_call":      "FLOAT DEFAULT 0",
+                    "delta_put":      "FLOAT DEFAULT 0",
+                    "gamma_put":      "FLOAT DEFAULT 0",
+                    "theta_put":      "FLOAT DEFAULT 0",
+                    "vega_put":       "FLOAT DEFAULT 0",
+                    "is_next_expiry": "BOOLEAN DEFAULT 0",
+                }
+                for col, col_def in new_cols.items():
+                    if col not in existing:
+                        conn.execute(
+                            text(f"ALTER TABLE option_eod_prices ADD COLUMN {col} {col_def}")
+                        )
+                        logger.info(f"Migrated option_eod_prices: added column '{col}'")
                 conn.execute(text(
                     "CREATE INDEX IF NOT EXISTS idx_eod_index_ts "
                     "ON option_eod_prices(index_name, timestamp)"
@@ -420,6 +520,23 @@ class DatabaseManager:
                 conn.commit()
         except Exception as e:
             logger.warning(f"option_eod_prices migration: {e}")
+
+    def _migrate_option_chain_snapshots(self):
+        """Add avg_atm_iv column to option_chain_snapshots if missing (idempotent)."""
+        try:
+            with self.engine.connect() as conn:
+                existing = {
+                    row[1]
+                    for row in conn.execute(text("PRAGMA table_info(option_chain_snapshots)"))
+                }
+                if "avg_atm_iv" not in existing:
+                    conn.execute(text(
+                        "ALTER TABLE option_chain_snapshots ADD COLUMN avg_atm_iv FLOAT DEFAULT 0"
+                    ))
+                    logger.info("Migrated option_chain_snapshots: added column 'avg_atm_iv'")
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"option_chain_snapshots migration: {e}")
 
     def _migrate_market_candles(self):
         """Add oi and is_futures columns to market_candles if missing (idempotent)."""
@@ -569,6 +686,36 @@ class DatabaseManager:
                 .all()
             )
 
+    def get_iv_rank(self, index_name: str, current_iv: float,
+                    lookback_days: int = 20) -> float:
+        """
+        Compute IV Rank (0-100 percentile) for current_iv vs last lookback_days
+        of avg_atm_iv stored in option_chain_snapshots.
+        Returns 0.0 if insufficient history.
+        """
+        if current_iv <= 0:
+            return 0.0
+        try:
+            cutoff = datetime.now() - timedelta(days=lookback_days)
+            with self.get_session() as session:
+                rows = (
+                    session.query(OptionChainSnapshot.avg_atm_iv)
+                    .filter(
+                        OptionChainSnapshot.index_name == index_name,
+                        OptionChainSnapshot.timestamp  >= cutoff,
+                        OptionChainSnapshot.avg_atm_iv > 0,
+                    )
+                    .all()
+                )
+            hist = [float(r[0]) for r in rows if r[0]]
+            if not hist:
+                return 0.0
+            below = sum(1 for v in hist if v <= current_iv)
+            return round(below / len(hist) * 100.0, 1)
+        except Exception as e:
+            logger.debug(f"get_iv_rank [{index_name}]: {e}")
+            return 0.0
+
     # ─── ENGINE SIGNALS ────────────────────────────────────────────
 
     def save_engine_signal(self, signal_data: Dict[str, Any]):
@@ -624,7 +771,7 @@ class DatabaseManager:
                 "pcr":           float(h.pcr),
                 "label":         -1,
                 "label_quality": -1,
-                "created_at":    datetime.utcnow(),
+                "created_at":    datetime.now(),
             })
         try:
             with self.get_session() as session:
@@ -773,7 +920,7 @@ class DatabaseManager:
                 alert.outcome = outcome
                 alert.outcome_pnl = pnl
                 alert.outcome_notes = notes
-                alert.outcome_timestamp = datetime.utcnow()
+                alert.outcome_timestamp = datetime.now()
 
     # ─── OPTION PRICE HISTORY ──────────────────────────────────────
 
@@ -820,6 +967,41 @@ class DatabaseManager:
             return result
 
     # ─── ML FEATURE STORE ──────────────────────────────────────────
+
+    def get_rolling_setup_win_rates(
+        self,
+        index_name: str,
+        lookback: int = 20
+    ) -> Dict[str, float]:
+        """
+        Return a dict {setup_name: win_rate_pct (0-100)} based on the last
+        `lookback` labeled trades per setup for the given index.
+
+        Only labeled rows (label >= 0) are counted. Win = label == 1.
+        Returns empty dict if no data.
+        """
+        with self.get_session() as session:
+            from database.models import SetupAlert
+            from sqlalchemy import func, case
+
+            rows = (
+                session.query(
+                    SetupAlert.setup_name,
+                    func.count(SetupAlert.id).label("total"),
+                    func.sum(case((SetupAlert.label == 1, 1), else_=0)).label("wins"),
+                )
+                .filter(
+                    SetupAlert.index_name == index_name,
+                    SetupAlert.label >= 0,
+                )
+                .group_by(SetupAlert.setup_name)
+                .all()
+            )
+            result: Dict[str, float] = {}
+            for r in rows:
+                if r.total and r.total > 0:
+                    result[r.setup_name] = round((r.wins or 0) / r.total * 100.0, 1)
+            return result
 
     def save_ml_features(self, features: Dict[str, Any]):
         with self.get_session() as session:
@@ -978,7 +1160,7 @@ class DatabaseManager:
             alert = session.query(AlertModel).filter(AlertModel.id == alert_id).first()
             if alert:
                 alert.outcome           = outcome_str
-                alert.outcome_timestamp = datetime.utcnow()
+                alert.outcome_timestamp = datetime.now()
 
     def update_post_close_outcome(
         self,
@@ -1137,6 +1319,53 @@ class DatabaseManager:
         except Exception as e:
             logger.warning(f"s11_paper_trades migration: {e}")
 
+    # ─── AUTO PAPER TRADES ─────────────────────────────────────────
+
+    def _migrate_auto_paper_trades(self):
+        """Create auto_paper_trades table if it doesn't exist."""
+        try:
+            from database.models import AutoPaperTrade
+            AutoPaperTrade.__table__.create(self.engine, checkfirst=True)
+        except Exception as e:
+            logger.warning(f"auto_paper_trades migration: {e}")
+
+    def save_auto_paper_trade(self, rec: dict) -> None:
+        """Insert or update an AutoPaperTrade row by order_id."""
+        try:
+            from database.models import AutoPaperTrade
+            with self.get_session() as session:
+                row = session.query(AutoPaperTrade).filter(
+                    AutoPaperTrade.order_id == rec["order_id"]
+                ).first()
+                if row is None:
+                    valid = {c.name for c in AutoPaperTrade.__table__.columns}
+                    row = AutoPaperTrade(**{k: v for k, v in rec.items() if k in valid})
+                    session.add(row)
+                else:
+                    valid = {c.name for c in AutoPaperTrade.__table__.columns}
+                    for k, v in rec.items():
+                        if k in valid and k != "id":
+                            setattr(row, k, v)
+        except Exception as e:
+            logger.warning(f"save_auto_paper_trade: {e}")
+
+    def get_auto_paper_trades_today(self, date_str: str) -> list:
+        """Return all AutoPaperTrade rows for a given date (YYYY-MM-DD)."""
+        try:
+            from database.models import AutoPaperTrade
+            with self.get_session() as session:
+                rows = (
+                    session.query(AutoPaperTrade)
+                    .filter(AutoPaperTrade.date == date_str)
+                    .order_by(AutoPaperTrade.placed_at)
+                    .all()
+                )
+                session.expunge_all()
+                return rows
+        except Exception as e:
+            logger.warning(f"get_auto_paper_trades_today: {e}")
+            return []
+
     # ─── S11 PAPER TRADES ──────────────────────────────────────────
 
     def save_s11_paper_trade(self, data: Dict[str, Any]) -> int:
@@ -1160,11 +1389,13 @@ class DatabaseManager:
                     setattr(row, k, v)
 
     def get_open_s11_trades(self) -> List[S11PaperTrade]:
-        """Return all OPEN S11PaperTrade rows — used by S11Monitor on startup (rehydrate)."""
+        """Return today's OPEN S11PaperTrade rows — used by S11Monitor on startup (rehydrate)."""
+        today = datetime.now().strftime("%Y-%m-%d")
         with self.get_session() as session:
             rows = (
                 session.query(S11PaperTrade)
                 .filter(S11PaperTrade.status == "OPEN")
+                .filter(S11PaperTrade.date == today)
                 .order_by(S11PaperTrade.entry_time)
                 .all()
             )
@@ -1225,6 +1456,27 @@ class DatabaseManager:
                 "avg_mae_atr": round(float(row.avg_mae or 0), 2),
             }
 
+    # ─── LIFECYCLE ────────────────────────────────────────────────
+
+    def close(self):
+        """
+        Flush the WAL to the main DB file and dispose the engine pool.
+        Call on clean application shutdown so no data is left in the WAL.
+        Without this, SQLite WAL accumulates indefinitely when the process
+        is stopped without a checkpoint (e.g. window closed, SIGTERM).
+        """
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+                conn.commit()
+            logger.info("WAL checkpoint complete")
+        except Exception as e:
+            logger.warning(f"WAL checkpoint failed (non-fatal): {e}")
+        try:
+            self.engine.dispose()
+        except Exception:
+            pass
+
     # ─── RETENTION / PURGE ────────────────────────────────────────
 
     def purge_old_data(self) -> Dict[str, int]:
@@ -1233,17 +1485,27 @@ class DatabaseManager:
         Safe to call on startup and once per trading day.
         Returns counts of deleted rows per table.
         """
-        now = datetime.utcnow()
+        now = datetime.now()
         cutoffs = {
             "option_chain_snapshots": now - timedelta(days=config.OC_RETENTION_DAYS),
             "engine_signals":         now - timedelta(days=config.ENGINE_SIGNAL_RETENTION_DAYS),
             "market_candles":         now - timedelta(days=config.CANDLE_RETENTION_DAYS),
+            "option_eod_prices":      now - timedelta(days=config.OPTION_EOD_RETENTION_DAYS),
+            "option_price_history":   now - timedelta(days=config.OPTION_PRICE_HISTORY_RETENTION_DAYS),
+            "alerts":                 now - timedelta(days=config.ALERT_RETENTION_DAYS),
+            "ml_feature_store":       now - timedelta(days=config.ML_FEATURE_RETENTION_DAYS),
+            "trade_outcomes":         now - timedelta(days=config.TRADE_OUTCOME_RETENTION_DAYS),
         }
         deleted = {}
         table_ts_col = {
             "option_chain_snapshots": "timestamp",
             "engine_signals":         "timestamp",
             "market_candles":         "timestamp",
+            "option_eod_prices":      "timestamp",
+            "option_price_history":   "created_at",
+            "alerts":                 "timestamp",
+            "ml_feature_store":       "created_at",
+            "trade_outcomes":         "entry_time",
         }
         try:
             with self.engine.connect() as conn:

@@ -1,6 +1,6 @@
 # NiftyTrader Intelligence System — Complete Guide
 
-> Version 3.1 | Updated: March 2026
+> Version 3.2 | Updated: April 2026
 > Intraday Options Signal & ML Intelligence Platform for Indian Equity Indices
 > Status: **Production Ready**
 
@@ -51,7 +51,7 @@ That is exactly what NiftyTrader does — automatically, in real time, every 3 m
 |---------|--------|
 | Indices covered | NIFTY, BANKNIFTY, MIDCPNIFTY, SENSEX |
 | Signal scan frequency | Every 3 minutes |
-| Triggering signal engines | 6 (Compression, DI, Volume, Liquidity Trap, Gamma, Market Regime) |
+| Triggering signal engines | 7 (Compression, DI, Volume, Liquidity Trap, Gamma, VWAP Pressure, Market Regime) |
 | Data-only engines | 2 (Option Chain, IV Expansion) — feed ML only |
 | MTF modifier | 1 (Multi-Timeframe Alignment — adjusts confidence score, not a gate) |
 | ML features tracked | 93 parameters per signal |
@@ -119,10 +119,12 @@ LIVE MARKET DATA
 
 | Index | Exchange | Lot Size | Options Type | Expiry (Current Rules — Sep 2025+) |
 |-------|----------|----------|--------------|-------------------------------------|
-| **NIFTY** | NSE | 50 | Weekly | Every **Tuesday** |
-| **BANKNIFTY** | NSE | 15 | Monthly | Last **Tuesday** of month |
-| **MIDCPNIFTY** | NSE | 75 | Monthly | Last **Tuesday** of month |
-| **SENSEX** | BSE | 10 | Weekly | Every **Thursday** |
+| **NIFTY** | NSE | **65** | Weekly | Every **Tuesday** |
+| **BANKNIFTY** | NSE | **30** | Monthly | Last **Tuesday** of month |
+| **MIDCPNIFTY** | NSE | **120** | Monthly | Last **Tuesday** of month |
+| **SENSEX** | BSE | **20** | Weekly | Every **Thursday** |
+
+> **Lot sizes updated March 2026** — SEBI revised contract sizes. Previous sizes: NIFTY=50, BANKNIFTY=15, MIDCPNIFTY=75, SENSEX=10.
 
 > **Note on SEBI Rule Changes:**
 > SEBI changed options expiry rules twice:
@@ -202,11 +204,25 @@ Options market makers hedge at round numbers (like 22000, 22200 for NIFTY). Thes
 **Technical detail:**
 - Calculates distance to nearest significant OI strike level
 - Tracks Call Wall (largest call OI) and Put Wall (largest put OI)
-- Fires when price is within 0.3% of a gamma level, or breaks through one
+- Fires when price is within 0.2% of a gamma level, or breaks through one (gamma flip)
 
 ---
 
-### Engine 6 — Market Regime Detector
+### Engine 6 — VWAP Pressure Detector
+**What it watches:** Price bouncing off or breaking through the day's volume-weighted average price
+
+**Simple explanation:**
+VWAP (Volume Weighted Average Price) is the fairest price of the day — institutions use it as a benchmark. When price bounces off VWAP with strong volume, it signals a high-probability directional move.
+
+**Technical detail:**
+- Computes VWAP from session open (9:15 IST) using futures volume
+- Fires when: price is within 0.5×ATR of VWAP AND volume ≥ 1.2× average AND candle body ≥ 35% of range
+- Direction: bounce up from VWAP = BULLISH, bounce down = BEARISH, cross-through also captured
+- `VWAP_TOUCH_ATR_MULT = 0.5`, `VWAP_VOL_RATIO_MIN = 1.2`, `VWAP_BODY_MIN_RATIO = 0.35`
+
+---
+
+### Engine 7 — Market Regime Detector
 **What it watches:** Whether the market is trending or ranging
 
 **Simple explanation:**
@@ -245,14 +261,15 @@ Adjusts the confidence score up or down. When set to STRONG mode, signals are bl
 ## 5. How a Trade Signal is Born
 
 ```
-Every 3 minutes, all 6 triggering engines check the latest candle:
+Every 3 minutes, all 7 triggering engines check the latest candle:
 
 Engine 1 (Compression):   YES (energy building)
 Engine 2 (DI Momentum):   YES (bulls leading)
 Engine 3 (Volume):        NO  (normal volume)
 Engine 4 (Liq Trap):      NO
 Engine 5 (Gamma):         NO
-Engine 6 (Regime):        YES (TRENDING confirmed)
+Engine 6 (VWAP):          NO
+Engine 7 (Regime):        YES (TRENDING confirmed)
                           ---
 engines_count = 3  ← below threshold of 4 → no signal
 
@@ -262,7 +279,8 @@ Engine 2 (DI Momentum):   YES
 Engine 3 (Volume):        YES
 Engine 4 (Liq Trap):      NO
 Engine 5 (Gamma):         YES
-Engine 6 (Regime):        YES
+Engine 6 (VWAP):          YES
+Engine 7 (Regime):        NO
                           ---
 engines_count = 5  ← EARLY MOVE ALERT fires
 
@@ -354,7 +372,7 @@ The system tracks real rupee P&L for every trade signal, not just points.
 
 ```
 At signal time (registration):
-  lot_size        = from SYMBOL_MAP (NIFTY=50, BANKNIFTY=15, MIDCPNIFTY=75, SENSEX=10)
+  lot_size        = from SYMBOL_MAP (NIFTY=65, BANKNIFTY=30, MIDCPNIFTY=120, SENSEX=20)  ← SEBI revised Mar 2026
   investment_amt  = entry_premium × lot_size
   pnl_sl          = (stop_loss_premium − entry_premium) × lot_size
   pnl_t1          = (t1_premium − entry_premium) × lot_size
@@ -370,10 +388,10 @@ At close:
 
 ### Example (NIFTY CE)
 ```
-Entry: 85.0  |  Lot size: 50  |  Investment: ₹4,250
-T2 hit at 108.5 → realized = (108.5 − 85.0) × 50 × 0.5 = ₹587.50
+Entry: 85.0  |  Lot size: 65  |  Investment: ₹5,525
+T2 hit at 108.5 → realized = (108.5 − 85.0) × 65 × 0.5 = ₹763.75
 SL then hit (at cost 85.0) → remaining 50% = ₹0
-Total realized: ₹587.50 on ₹4,250 invested = +13.8% return
+Total realized: ₹763.75 on ₹5,525 invested = +13.8% return
 ```
 
 ### Where P&L is Stored
@@ -739,7 +757,30 @@ The expiry calendar works in two layers:
 
 ---
 
-## 19. Production Fixes Applied (v3.0 → v3.1)
+## 19. Production Fixes Applied
+
+### v3.1 → v3.2 (April 2026)
+
+10 fixes applied in this session:
+
+| ID | Severity | File | Fix |
+|----|----------|------|-----|
+| V-1 | High | fyers_adapter.py | **Pre-market price mismatch** — switched from `lp` (last tick) to `cp` (official NSE VWAP-based close) outside 9:15–15:30 IST. Pre-market `lp` diverges 30–50 pts from official close. |
+| V-2 | High | data_manager.py | **Bootstrap fallback chain** — `prev_close` now fetched before spot API check. Outside live hours: uses official close instead of candle LTP when quotes API fails (e.g. 429). |
+| V-3 | High | data_manager.py | **Pre-market 429 flood** — Added `_market_active` guard (9:00–15:35 IST) blocking all live API calls outside this window. Prevents Fyers rate-limit cascade before market opens. |
+| V-4 | High | data_manager.py | **OC refresh 429** — Applied `_market_active` guard to `get_option_chain()` calls which internally call `get_all_spot_prices()`. Hidden API path now fully guarded. |
+| V-5 | High | data_manager.py | **Circuit breaker** — `_CircuitBreaker` class added. Opens after 5 consecutive broker failures; pauses API calls for 60s; auto-resets via probe call. Wraps spot + futures batch calls. |
+| V-6 | Medium | database/manager.py | **Missing DB indexes** — Added 4 indexes: `idx_candles_idx_ts`, `idx_features_alert_idx`, `idx_outcomes_open`, `idx_alerts_ts_sig`. Expected 10× speedup on alert/candle queries. |
+| V-7 | Medium | database/manager.py | **busy_timeout** raised from 30s to 60s (both PRAGMA and SQLAlchemy timeout). Prevents false "database locked" errors under concurrent writes. |
+| V-8 | Medium | engines/signal_aggregator.py | **Per-engine try-catch + 5s timeout** — `_run_engine()` wrapper using `concurrent.futures`. A single crashed/hung engine returns safe default and evaluation continues. |
+| V-9 | Medium | alerts/telegram_alert.py | **Telegram retry** — Exponential backoff (2s, 4s) with up to 3 attempts. Honours Telegram `retry_after` on 429. Previously single-attempt with silent failure. |
+| V-10 | Medium | ml/model_manager.py | **Feature column validation** — On model load, compares saved `feature_cols` against current `FEATURE_COLUMNS`. Warns if mismatch (new engine added or old removed since training). |
+| V-11 | Medium | ml/auto_labeler.py | **Holiday check** — `_NSE_HOLIDAYS` set (2025–2026) added. Labeler skips records and lookahead candles on market holidays to prevent cross-session label contamination. |
+| V-12 | Low | data/adapters/fyers_adapter.py | **Token file cache** — `load_fyers_token()` now caches result for 60s instead of reading disk every call. Invalidated immediately on `save_fyers_token()`. |
+
+---
+
+### v3.0 → v3.1 (March 2026)
 
 12 bugs fixed before production deployment:
 
@@ -791,7 +832,7 @@ The expiry calendar works in two layers:
 | **Mock mode** | App running without live broker — uses simulated data for testing |
 | **DTE** | Days To Expiry — how many days until the current options contract expires |
 | **Choppiness Index** | Measures if market is trending or sideways. Below 61.8 = trending |
-| **lot_size** | Contracts per lot: NIFTY=50, BANKNIFTY=15, MIDCPNIFTY=75, SENSEX=10 |
+| **lot_size** | Contracts per lot: NIFTY=65, BANKNIFTY=30, MIDCPNIFTY=120, SENSEX=20 (SEBI revised Mar 2026) |
 | **Investment** | `entry_premium × lot_size` — rupees at risk per lot when entering the trade |
 | **Realized P&L** | Actual rupee profit or loss after the trade closes |
 | **Setup** | A named trading condition (e.g., S20_DI_VOL_TREND) with a known win rate from testing |

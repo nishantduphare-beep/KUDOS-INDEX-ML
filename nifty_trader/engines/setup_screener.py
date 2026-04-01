@@ -95,7 +95,7 @@ class SetupScreener:
             # Option chain
             "option_chain_triggered": bool(oc_r.is_triggered),
             "pcr":                    pcr,
-            "iv_rank":                float(oc_r.features.get("iv_rank", 0)),
+            "iv_rank":                float(oc_r.features.get("avg_call_iv", 0)),
             # VWAP
             "vwap_triggered":         bool(vwap_r.is_triggered),
             # Regime

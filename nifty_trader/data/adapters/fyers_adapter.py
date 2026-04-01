@@ -34,53 +34,38 @@ from data.base_api import CombinedBrokerAdapter
 from data.structures import Candle, OptionChain, OptionStrike
 
 # ──────────────────────────────────────────────────────────────────
-# Black-Scholes IV computation (Fyers v3 doesn't return IV in chain)
+# Black-Scholes IV + Greeks — imported from shared bs_utils.py
+# Private aliases kept for any internal call-sites in this module.
 # ──────────────────────────────────────────────────────────────────
+from data.bs_utils import bs_iv as _bs_iv, bs_greeks as _bs_greeks
 
-def _bs_iv(ltp: float, spot: float, strike: float,
-           tte: float, rate: float, opt_type: str) -> float:
-    """
-    Compute implied volatility via Black-Scholes + Brent root-finding.
-    Returns IV as a percentage (e.g. 18.5 means 18.5%).
-    Returns 0.0 when IV cannot be determined.
-
-    ltp      — option market price
-    spot     — underlying spot price
-    strike   — option strike
-    tte      — time to expiry in years (e.g. 0.0274 for 10 days)
-    rate     — risk-free rate (e.g. 0.065 for 6.5%)
-    opt_type — "CE" or "PE"
-    """
-    if ltp <= 0 or spot <= 0 or strike <= 0 or tte <= 0:
-        return 0.0
-    try:
-        from scipy.stats import norm
-        from scipy.optimize import brentq
-
-        def bs(sigma: float) -> float:
-            if sigma <= 1e-6:
-                return 0.0
-            d1 = (math.log(spot / strike) + (rate + 0.5 * sigma ** 2) * tte) / (sigma * math.sqrt(tte))
-            d2 = d1 - sigma * math.sqrt(tte)
-            if opt_type == "CE":
-                return spot * norm.cdf(d1) - strike * math.exp(-rate * tte) * norm.cdf(d2)
-            else:
-                return strike * math.exp(-rate * tte) * norm.cdf(-d2) - spot * norm.cdf(-d1)
-
-        # Intrinsic value check — LTP below intrinsic means bad data, skip
-        intrinsic = (max(0.0, spot - strike) if opt_type == "CE"
-                     else max(0.0, strike - spot))
-        if ltp < intrinsic * 0.99:
-            return 0.0
-
-        iv = brentq(lambda s: bs(s) - ltp, 1e-4, 20.0, maxiter=100, xtol=1e-4)
-        return round(iv * 100.0, 2)   # express as percentage
-    except Exception:
-        return 0.0
 
 logger = logging.getLogger(__name__)
 
 TOKEN_FILE = Path("auth/fyers_token.json")
+
+
+def _fyers_retry(fn, *args, retries: int = 3, backoff: float = 0.5, **kwargs):
+    """
+    Call fn(*args, **kwargs) up to `retries` times with exponential backoff.
+    Returns the result on success, or raises the last exception.
+    Used for transient network / rate-limit errors from the Fyers API.
+    """
+    import time as _time
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                sleep_secs = backoff * (2 ** attempt)   # 0.5s, 1s, 2s
+                logger.warning(
+                    f"Fyers API call failed (attempt {attempt + 1}/{retries}): "
+                    f"{exc}  — retrying in {sleep_secs:.1f}s"
+                )
+                _time.sleep(sleep_secs)
+    raise last_exc
 _IST = config.IST
 REDIRECT_URI = "https://trade.fyers.in/api-login/redirect-uri/index.html"
 
@@ -106,14 +91,38 @@ def save_fyers_token(access_token: str, app_id: str):
         "expires_at":   exp.isoformat(),
     }
     TOKEN_FILE.write_text(json.dumps(payload, indent=2))
+    _invalidate_token_cache()   # force next load_fyers_token() to re-read from disk
     config.BROKER_CREDENTIALS["fyers"]["access_token"] = access_token
     config.BROKER_CREDENTIALS["fyers"]["token_expiry"] = exp.isoformat()
     logger.info(f"Fyers token saved — expires {exp.strftime('%d %b %Y %H:%M UTC')}")
 
 
+
+# ── Token file read cache ────────────────────────────────────────
+# Avoids hammering the disk on repeated reconnect attempts (every 15s).
+# Cache is valid for 60 seconds; invalidated immediately on save.
+_token_cache: Optional[Dict]  = None
+_token_cache_ts: float        = 0.0
+_TOKEN_CACHE_TTL: float       = 60.0   # seconds
+
+
+def _invalidate_token_cache():
+    global _token_cache, _token_cache_ts
+    _token_cache    = None
+    _token_cache_ts = 0.0
+
+
 def load_fyers_token() -> Optional[Dict]:
-    """Returns cached token dict if valid, else None."""
+    """Returns cached token dict if valid, else None. Result is cached for 60s."""
+    global _token_cache, _token_cache_ts
+    import time as _time_mod
+
+    # Return in-memory cache if still fresh
+    if _token_cache is not None and (_time_mod.monotonic() - _token_cache_ts) < _TOKEN_CACHE_TTL:
+        return _token_cache
+
     if not TOKEN_FILE.exists():
+        _token_cache = None
         return None
     try:
         data = json.loads(TOKEN_FILE.read_text())
@@ -124,10 +133,13 @@ def load_fyers_token() -> Optional[Dict]:
         if remaining.total_seconds() > 300:          # > 5 minutes left
             h, m = divmod(int(remaining.total_seconds()) // 60, 60)
             logger.debug(f"Fyers token valid — {h}h {m}m remaining")
+            _token_cache    = data
+            _token_cache_ts = _time_mod.monotonic()
             return data
         logger.info("Fyers token expired")
     except Exception as e:
         logger.warning(f"Token read error: {e}")
+    _token_cache = None
     return None
 
 
@@ -316,13 +328,45 @@ class FyersAdapter(CombinedBrokerAdapter):
                 return dict(self._spot_cache)
             # Build reverse map: symbol → index_name
             rev = {v: k for k, v in self.SPOT_SYMBOLS.items()}
+
+            # ── lp vs cp: WHY WE SWITCH FIELDS ────────────────────────────────
+            # Fyers quotes() returns two price fields per symbol:
+            #   lp = "last traded price" — the last tick at market close (3:30 PM).
+            #        This is a point-in-time snapshot, NOT the official closing price.
+            #   cp = "closing price"     — NSE's VWAP-based official close, published
+            #        around 3:35 PM after the closing session ends.
+            #
+            # The problem: pre-market and post-market, lp can be 30–50 points away
+            # from cp because the final VWAP-weighted calculation shifts the official
+            # close away from the last tick. Using lp outside live hours causes the
+            # dashboard to show a "wrong" price that doesn't match Fyers watchlist or
+            # NSE website — confusing and potentially dangerous for trade planning.
+            #
+            # The fix: use cp outside live hours (9:15–15:30 IST).
+            #          use lp during live hours (cp lags during live session).
+            #
+            # ⚠️  DO NOT simplify this to always use lp — the price mismatch will
+            #     reappear pre-market and confuse users comparing to broker watchlist.
+            # ──────────────────────────────────────────────────────────────────────
+            from datetime import time as _time
+            _now = datetime.now().time()
+            _market_open  = _time(9, 15)
+            _market_close = _time(15, 30)
+            _live = _market_open <= _now <= _market_close
             result = {}
             for item in d:
                 sym = item.get("n", "")
-                lp  = item.get("v", {}).get("lp", 0)
+                v   = item.get("v", {})
+                lp  = v.get("lp", 0)
+                cp  = v.get("cp", 0)   # official NSE closing price (VWAP-based, ~3:35 PM)
                 idx = rev.get(sym)
-                if idx and lp:
-                    result[idx] = float(lp)
+                if not idx:
+                    continue
+                # Live session: lp is real-time. Outside hours: cp is accurate.
+                # Fall back to lp if cp is zero (broker didn't populate it yet).
+                price = lp if _live else (cp or lp)
+                if price:
+                    result[idx] = float(price)
             if result:
                 self._spot_cache = result
             return dict(self._spot_cache)
@@ -340,15 +384,16 @@ class FyersAdapter(CombinedBrokerAdapter):
         if not self._fyers:
             return []
         from_dt = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+        payload = {
+            "symbol":      self.SPOT_SYMBOLS[index_name],
+            "resolution":  self.INTERVAL_MAP.get(interval_minutes, "3"),
+            "date_format": "1",
+            "range_from":  from_dt,
+            "range_to":    datetime.now().strftime("%Y-%m-%d"),
+            "cont_flag":   "1",
+        }
         try:
-            resp = self._fyers.history({
-                "symbol": self.SPOT_SYMBOLS[index_name],
-                "resolution": self.INTERVAL_MAP.get(interval_minutes, "3"),
-                "date_format": "1",
-                "range_from": from_dt,
-                "range_to": datetime.now().strftime("%Y-%m-%d"),
-                "cont_flag": "1",
-            })
+            resp = _fyers_retry(self._fyers.history, payload)
             candles = [
                 Candle(index_name, datetime.fromtimestamp(r[0]),
                        float(r[1]), float(r[2]), float(r[3]), float(r[4]),
@@ -403,15 +448,16 @@ class FyersAdapter(CombinedBrokerAdapter):
             return []
         symbol  = self._near_month_futures_symbol(index_name)
         from_dt = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+        payload = {
+            "symbol":      symbol,
+            "resolution":  self.INTERVAL_MAP.get(interval_minutes, "3"),
+            "date_format": "1",
+            "range_from":  from_dt,
+            "range_to":    datetime.now().strftime("%Y-%m-%d"),
+            "cont_flag":   "1",
+        }
         try:
-            resp = self._fyers.history({
-                "symbol":      symbol,
-                "resolution":  self.INTERVAL_MAP.get(interval_minutes, "3"),
-                "date_format": "1",
-                "range_from":  from_dt,
-                "range_to":    datetime.now().strftime("%Y-%m-%d"),
-                "cont_flag":   "1",
-            })
+            resp = _fyers_retry(self._fyers.history, payload)
             candles = [
                 Candle(index_name, datetime.fromtimestamp(r[0]),
                        float(r[1]), float(r[2]), float(r[3]), float(r[4]),
@@ -472,29 +518,38 @@ class FyersAdapter(CombinedBrokerAdapter):
             return {}
 
     # ─── India VIX ───────────────────────────────────────────────
+    # Fyers uses different symbol formats across API versions.
+    # Try each in order — first success wins and is cached for the session.
+    _VIX_SYMBOLS = ["NSE:INDIAVIX-INDEX", "NSE:INDIA VIX", "NSE:INDIA_VIX-INDEX"]
+
     def get_vix(self) -> float:
         """
         Fetch India VIX from Fyers quotes API.
-        Symbol: NSE:INDIA VIX — available as a Fyers index quote.
-        Returns 0.0 on failure (VIX unavailable from all brokers).
+        Tries multiple symbol formats; caches the working one for the session.
+        Returns 0.0 on failure.
         """
         if not self._fyers:
             return 0.0
-        try:
-            resp = self._fyers.quotes({"symbols": "NSE:INDIA VIX"})
-            if resp and resp.get("s") == "ok":
-                d = resp.get("d", [])
-                if d:
-                    vix = float(d[0].get("v", {}).get("lp", 0) or 0)
-                    if vix > 0:
-                        return vix
-            # API returned ok but no usable VIX value
-            logger.debug("VIX fetch: empty response from Fyers")
-        except Exception as e:
-            # m3 fix: warn once per session instead of silent debug
-            if not getattr(self, "_vix_warn_logged", False):
-                logger.warning(f"VIX fetch failed (will keep retrying silently): {e}")
-                self._vix_warn_logged = True
+        # Use cached working symbol if found in a previous call
+        symbols_to_try = ([self._vix_working_symbol]
+                          if getattr(self, "_vix_working_symbol", None)
+                          else self._VIX_SYMBOLS)
+        for sym in symbols_to_try:
+            try:
+                resp = self._fyers.quotes({"symbols": sym})
+                if resp and resp.get("s") == "ok":
+                    d = resp.get("d", [])
+                    if d:
+                        vix = float(d[0].get("v", {}).get("lp", 0) or 0)
+                        if vix > 0:
+                            self._vix_working_symbol = sym   # cache for next call
+                            return vix
+            except Exception as e:
+                logger.debug(f"VIX fetch attempt failed for {sym}: {e}")
+        # All symbols exhausted — warn once per session
+        if not getattr(self, "_vix_warn_logged", False):
+            logger.warning("VIX fetch: all symbol formats returned 0 — VIX gate disabled")
+            self._vix_warn_logged = True
         return 0.0
 
     # ─── Previous Day Close ───────────────────────────────────────
@@ -564,22 +619,25 @@ class FyersAdapter(CombinedBrokerAdapter):
             return []
 
     # ─── Options Data ─────────────────────────────────────────────
-    def get_option_chain(self, index_name: str) -> OptionChain:
+    def get_option_chain(self, index_name: str, expiry_ts: int = 0) -> OptionChain:
         """
         Fyers v3 optionchain response structure:
           resp["data"]["expiryData"]   → list of {date, expiry(unix)}
           resp["data"]["optionsChain"] → flat list of individual CE/PE items
             each item: {strike_price, option_type, oi, oich, volume, ltp, ...}
             index row has strike_price == -1 (skip it)
+
+        expiry_ts — pass unix timestamp to fetch a specific expiry (e.g. second expiry).
+                    Pass 0 (default) to fetch the nearest/current expiry.
         """
         if not self._fyers:
             return OptionChain(index_name, 0.0, "", [])
         spot = self.get_spot_price(index_name)
         try:
-            resp = self._fyers.optionchain({
+            resp = _fyers_retry(self._fyers.optionchain, {
                 "symbol":      self.SPOT_SYMBOLS[index_name],
                 "strikecount": config.ATM_STRIKE_RANGE,
-                "timestamp":   "",
+                "timestamp":   str(expiry_ts) if expiry_ts else "",
             })
 
             data        = resp.get("data", {})
@@ -635,6 +693,8 @@ class FyersAdapter(CombinedBrokerAdapter):
                 pe_ltp  = pe.get("ltp", 0.0)
                 call_iv = _bs_iv(ce_ltp, spot, s_price, tte, _rate, "CE")
                 put_iv  = _bs_iv(pe_ltp, spot, s_price, tte, _rate, "PE")
+                cg = _bs_greeks(spot, s_price, tte, _rate, "CE", call_iv)
+                pg = _bs_greeks(spot, s_price, tte, _rate, "PE", put_iv)
                 strikes.append(OptionStrike(
                     strike=s_price, expiry=expiry_str,
                     call_oi=ce.get("oi", 0),
@@ -642,14 +702,33 @@ class FyersAdapter(CombinedBrokerAdapter):
                     call_volume=ce.get("volume", 0),
                     call_iv=call_iv,
                     call_ltp=ce_ltp,
+                    call_delta=cg["delta"],
+                    call_gamma=cg["gamma"],
+                    call_theta=cg["theta"],
+                    call_vega=cg["vega"],
                     put_oi=pe.get("oi", 0),
                     put_oi_change=pe.get("oi_change", 0),
                     put_volume=pe.get("volume", 0),
                     put_iv=put_iv,
                     put_ltp=pe_ltp,
+                    put_delta=pg["delta"],
+                    put_gamma=pg["gamma"],
+                    put_theta=pg["theta"],
+                    put_vega=pg["vega"],
                 ))
 
-            return OptionChain(index_name, spot, expiry_str, strikes)
+            # Capture second expiry info (only when fetching primary chain)
+            next_expiry      = ""
+            next_expiry_unix = 0
+            if not expiry_ts and len(expiry_list) > 1:
+                next_expiry      = expiry_list[1].get("date", "")
+                next_expiry_unix = int(expiry_list[1].get("expiry", 0))
+
+            return OptionChain(
+                index_name, spot, expiry_str, strikes,
+                next_expiry=next_expiry,
+                next_expiry_unix=next_expiry_unix,
+            )
         except Exception as e:
             logger.error(f"Fyers option chain [{index_name}]: {e}")
             return OptionChain(index_name, spot, "", [])

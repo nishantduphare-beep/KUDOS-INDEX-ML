@@ -11,8 +11,8 @@ from datetime import date, datetime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QFrame, QSlider, QSpinBox, QSplitter, QTextEdit,
-    QSizePolicy, QPushButton,
+    QFrame, QSlider, QSpinBox, QDoubleSpinBox, QSplitter, QTextEdit,
+    QSizePolicy, QPushButton, QMessageBox, QRadioButton, QButtonGroup,
 )
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QColor
@@ -257,9 +257,108 @@ class HQTradesTab(QWidget):
         self._at_live_btn.setStyleSheet(_btn_off_ss)
         self._at_live_btn.clicked.connect(self._on_live_btn_clicked)
 
+        self._at_halt_btn = QPushButton("🛑  HALT")
+        self._at_halt_btn.setFixedHeight(26)
+        self._at_halt_btn.setStyleSheet(_btn_off_ss)
+        self._at_halt_btn.clicked.connect(self._on_halt_btn_clicked)
+
         at_ly.addWidget(self._at_paper_btn)
         at_ly.addWidget(self._at_live_btn)
+        at_ly.addWidget(self._at_halt_btn)
         ly.addWidget(at_bar)
+
+        # ── Trade Settings bar ────────────────────────────────────
+        ts_bar = QFrame()
+        ts_bar.setObjectName("TSBar")
+        ts_bar.setStyleSheet(
+            "#TSBar { background:#0d1117; border:1px solid #21262d; border-radius:4px; }"
+        )
+        ts_ly = QHBoxLayout(ts_bar)
+        ts_ly.setContentsMargins(14, 5, 14, 5)
+        ts_ly.setSpacing(18)
+
+        _spin_ss = (
+            "QDoubleSpinBox, QSpinBox {"
+            "  background:#161b22; color:#c9d1d9; border:1px solid #30363d;"
+            "  border-radius:3px; padding:1px 4px; font-size:11px;"
+            "}"
+            "QDoubleSpinBox:focus, QSpinBox:focus { border:1px solid #58a6ff; }"
+        )
+        _radio_ss = "QRadioButton { color:#8b949e; font-size:11px; }"
+
+        # ── Max Loss section ──────────────────────────────────────
+        ts_ly.addWidget(_lbl("MAX LOSS:", "#8b949e", bold=True, size=10))
+
+        self._loss_rbr = QRadioButton("₹")
+        self._loss_rbr.setStyleSheet(_radio_ss)
+        self._loss_rbp = QRadioButton("%")
+        self._loss_rbp.setStyleSheet(_radio_ss)
+        self._loss_mode_grp = QButtonGroup(self)
+        self._loss_mode_grp.addButton(self._loss_rbr, 0)   # id 0 = ₹ mode
+        self._loss_mode_grp.addButton(self._loss_rbp, 1)   # id 1 = % mode
+        self._loss_rbr.setChecked(True)
+
+        self._loss_rs = QDoubleSpinBox()
+        self._loss_rs.setRange(100, 5_000_000)
+        self._loss_rs.setDecimals(0)
+        self._loss_rs.setSingleStep(500)
+        self._loss_rs.setValue(config.AUTO_TRADE_MAX_DAILY_LOSS)
+        self._loss_rs.setFixedWidth(88)
+        self._loss_rs.setStyleSheet(_spin_ss)
+        self._loss_rs.setToolTip("Maximum loss in ₹ before trading stops for the day")
+
+        self._loss_ps = QDoubleSpinBox()
+        self._loss_ps.setRange(0.1, 100.0)
+        self._loss_ps.setDecimals(1)
+        self._loss_ps.setSingleStep(0.5)
+        self._loss_ps.setFixedWidth(64)
+        self._loss_ps.setStyleSheet(_spin_ss)
+        self._loss_ps.setToolTip("Maximum loss as % of capital before trading stops")
+        # compute initial pct from config
+        _init_pct = round(
+            config.AUTO_TRADE_MAX_DAILY_LOSS / max(1, config.DEFAULT_CAPITAL) * 100, 1
+        )
+        self._loss_ps.setValue(_init_pct)
+        self._loss_ps.setEnabled(False)   # ₹ mode active by default
+
+        self._loss_equiv_lbl = _lbl(
+            f"of ₹{config.DEFAULT_CAPITAL/100_000:.0f}L capital", "#484f58", size=10
+        )
+
+        ts_ly.addWidget(self._loss_rbr)
+        ts_ly.addWidget(self._loss_rs)
+        ts_ly.addWidget(self._loss_rbp)
+        ts_ly.addWidget(self._loss_ps)
+        ts_ly.addWidget(self._loss_equiv_lbl)
+
+        # ── Separator ─────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setStyleSheet("color:#30363d;")
+        ts_ly.addWidget(sep)
+
+        # ── Lots section ──────────────────────────────────────────
+        ts_ly.addWidget(_lbl("LOTS:", "#8b949e", bold=True, size=10))
+
+        self._lots_spin = QSpinBox()
+        self._lots_spin.setRange(1, 50)
+        self._lots_spin.setValue(max(1, config.AUTO_TRADE_FIXED_LOTS))
+        self._lots_spin.setFixedWidth(60)
+        self._lots_spin.setStyleSheet(_spin_ss)
+        self._lots_spin.setToolTip("Number of lots per trade")
+        ts_ly.addWidget(self._lots_spin)
+
+        self._lots_qty_lbl = _lbl("", "#484f58", size=10)
+        ts_ly.addWidget(self._lots_qty_lbl)
+
+        ts_ly.addStretch()
+        ly.addWidget(ts_bar)
+
+        # Wire signals — do this after all widgets are created
+        self._loss_mode_grp.idToggled.connect(self._on_loss_mode_toggled)
+        self._loss_rs.valueChanged.connect(self._on_loss_rs_changed)
+        self._loss_ps.valueChanged.connect(self._on_loss_ps_changed)
+        self._lots_spin.valueChanged.connect(self._on_lots_changed)
 
         # ── Main splitter ─────────────────────────────────────────
         splitter = QSplitter(Qt.Horizontal)
@@ -348,8 +447,87 @@ class HQTradesTab(QWidget):
     def set_order_manager(self, om):
         """Called by main_window after OrderManager is initialised."""
         self._order_manager = om
+        # Push current UI values into the backend
+        self._apply_loss_setting()
+        self._apply_lots_setting()
         self._refresh_auto_trade_bar()
         self.refresh_positions()
+
+    # ── Trade settings controls ────────────────────────────────────
+
+    def _on_loss_mode_toggled(self, btn_id: int, checked: bool):
+        """Switch between ₹ and % max-loss input modes."""
+        if not checked:
+            return
+        is_pct = (btn_id == 1)
+        self._loss_rs.setEnabled(not is_pct)
+        self._loss_ps.setEnabled(is_pct)
+        if is_pct:
+            self._loss_equiv_lbl.setText(
+                f"of ₹{config.DEFAULT_CAPITAL/100_000:.0f}L  "
+                f"≡ ₹{self._loss_ps.value() * config.DEFAULT_CAPITAL / 100:,.0f}"
+            )
+        else:
+            pct = self._loss_rs.value() / config.DEFAULT_CAPITAL * 100
+            self._loss_equiv_lbl.setText(
+                f"≡ {pct:.1f}% of ₹{config.DEFAULT_CAPITAL/100_000:.0f}L capital"
+            )
+        self._apply_loss_setting()
+
+    def _on_loss_rs_changed(self, value: float):
+        """₹ input changed — sync pct label and push to backend."""
+        # Sync % input silently (block its signal to avoid ping-pong)
+        self._loss_ps.blockSignals(True)
+        self._loss_ps.setValue(round(value / config.DEFAULT_CAPITAL * 100, 1))
+        self._loss_ps.blockSignals(False)
+        pct = value / config.DEFAULT_CAPITAL * 100
+        self._loss_equiv_lbl.setText(
+            f"≡ {pct:.1f}% of ₹{config.DEFAULT_CAPITAL/100_000:.0f}L capital"
+        )
+        self._apply_loss_setting()
+
+    def _on_loss_ps_changed(self, value: float):
+        """% input changed — sync ₹ label and push to backend."""
+        rupees = value * config.DEFAULT_CAPITAL / 100
+        self._loss_rs.blockSignals(True)
+        self._loss_rs.setValue(round(rupees))
+        self._loss_rs.blockSignals(False)
+        self._loss_equiv_lbl.setText(
+            f"of ₹{config.DEFAULT_CAPITAL/100_000:.0f}L  ≡ ₹{rupees:,.0f}"
+        )
+        self._apply_loss_setting()
+
+    def _apply_loss_setting(self):
+        """Push current max-loss value to OrderManager."""
+        if self._order_manager is None:
+            return
+        self._order_manager.set_max_daily_loss(self._loss_rs.value())
+
+    def _on_lots_changed(self, value: int):
+        """Lots spin changed — update qty label and push to backend."""
+        self._update_lots_qty_label(value)
+        if self._order_manager is None:
+            return
+        self._order_manager.set_fixed_lots(value)
+
+    def _apply_lots_setting(self):
+        """Push current lots value to OrderManager."""
+        if self._order_manager is None:
+            return
+        lots = self._lots_spin.value()
+        self._order_manager.set_fixed_lots(lots)
+        self._update_lots_qty_label(lots)
+
+    def _update_lots_qty_label(self, lots: int):
+        """Show e.g. '1 lot = 65 qty (NIFTY)'."""
+        # Show smallest-lot-size index as a hint
+        hint = ""
+        for name, sym in config.SYMBOL_MAP.items():
+            ls = sym.get("lot_size", 0)
+            if ls:
+                hint = f"= {lots * ls} qty ({name})"
+                break
+        self._lots_qty_lbl.setText(hint)
 
     # ── Auto trading controls ──────────────────────────────────────
 
@@ -360,12 +538,56 @@ class HQTradesTab(QWidget):
         self._order_manager.set_mode(new_mode)
         self._refresh_auto_trade_bar()
 
+    def _on_halt_btn_clicked(self):
+        if self._order_manager is None:
+            return
+        from trading.order_manager import OrderManager
+        if OrderManager.is_halted():
+            # Already halted — clear halt
+            OrderManager.set_halt(False)
+        else:
+            # Activate halt — confirm first
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Activate Trading Halt")
+            msg.setIcon(QMessageBox.Critical)
+            msg.setText(
+                "<b>Activate TRADING HALT?</b><br><br>"
+                "All order placement will be blocked immediately.<br>"
+                "The halt persists across app restarts until you clear it.<br><br>"
+                "Use this in emergencies (circuit breaker, wrong signal, etc.)"
+            )
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+            msg.setDefaultButton(QMessageBox.Cancel)
+            if msg.exec() == QMessageBox.Yes:
+                OrderManager.set_halt(True)
+        self._refresh_auto_trade_bar()
+
     def _on_live_btn_clicked(self):
         if self._order_manager is None:
             return
-        new_mode = "OFF" if self._order_manager.get_mode() == "LIVE" else "LIVE"
-        self._order_manager.set_mode(new_mode)
-        self._refresh_auto_trade_bar()
+        # Turning LIVE off — no confirmation needed
+        if self._order_manager.get_mode() == "LIVE":
+            self._order_manager.set_mode("OFF")
+            self._refresh_auto_trade_bar()
+            return
+        # Turning LIVE on — require explicit confirmation
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Activate LIVE Trading")
+        msg.setIcon(QMessageBox.Warning)
+        msg.setText(
+            "<b>You are about to enable LIVE trading.</b><br><br>"
+            "Real bracket orders will be placed at the exchange.<br>"
+            "Real money is at risk.<br><br>"
+            f"Daily cap: <b>{config.AUTO_TRADE_MAX_DAILY_ORDERS} orders</b> &nbsp;|&nbsp; "
+            f"Min confidence: <b>{config.AUTO_TRADE_MIN_CONFIDENCE}%</b> &nbsp;|&nbsp; "
+            f"Min engines: <b>{config.AUTO_TRADE_MIN_ENGINES}</b><br><br>"
+            "Are you sure?"
+        )
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        msg.setDefaultButton(QMessageBox.Cancel)
+        if msg.exec() == QMessageBox.Yes:
+            self._order_manager.set_live_mode(True)
+            self._refresh_auto_trade_bar()
 
     def _refresh_auto_trade_bar(self):
         """Update button styles and summary line to match current mode."""
@@ -412,17 +634,46 @@ class HQTradesTab(QWidget):
             self._at_live_btn.setText("⚡  Live Trade")
             self._at_live_btn.setStyleSheet(_off)
 
-        pnl    = summary.get("pnl", 0.0)
-        placed = summary.get("placed", 0)
-        cap    = summary.get("cap", 3)
-        wins   = summary.get("wins", 0)
-        losses = summary.get("losses", 0)
-        sign   = "+" if pnl >= 0 else ""
-        pnl_color = "#3fb950" if pnl > 0 else "#f85149" if pnl < 0 else "#484f58"
-        w_l = f"  W:{wins} L:{losses}" if placed > 0 else ""
-        self._at_summary_lbl.setText(f"Orders: {placed}/{cap}{w_l}  |  P&L: {sign}₹{pnl:,.2f}")
+        # ── HALT button state ──────────────────────────────────────
+        from trading.order_manager import OrderManager as _OM
+        _halt_on = (
+            "QPushButton { background:#4d0000; color:#ff4444; border:2px solid #ff2222;"
+            " padding:3px 14px; border-radius:3px; font-size:11px; font-weight:bold; }"
+            "QPushButton:hover { background:#6e0000; color:#ff7777; }"
+        )
+        if _OM.is_halted():
+            self._at_halt_btn.setText("✅  Clear Halt")
+            self._at_halt_btn.setStyleSheet(_halt_on)
+        else:
+            self._at_halt_btn.setText("🛑  HALT")
+            self._at_halt_btn.setStyleSheet(_off)
+
+        pnl          = summary.get("pnl", 0.0)
+        placed       = summary.get("placed", 0)
+        cap          = summary.get("cap", 3)
+        wins         = summary.get("wins", 0)
+        losses_count = summary.get("losses", 0)
+        loss_cap_hit = summary.get("loss_cap_hit", False)
+        loss_cap     = summary.get("loss_cap", config.AUTO_TRADE_MAX_DAILY_LOSS)
+        sign         = "+" if pnl >= 0 else ""
+        pnl_color    = "#3fb950" if pnl > 0 else "#f85149" if pnl < 0 else "#484f58"
+
+        if _OM.is_halted():
+            tag_color = "#ff4444"
+            tag       = "  ⛔ HALTED"
+        elif loss_cap_hit:
+            tag_color = "#f85149"
+            tag       = f"  ⛔ LOSS CAP ₹{loss_cap:,.0f} HIT"
+        else:
+            tag_color = pnl_color if placed > 0 else "#484f58"
+            tag       = ""
+
+        w_l = f"  W:{wins} L:{losses_count}" if placed > 0 else ""
+        self._at_summary_lbl.setText(
+            f"Orders: {placed}/{cap}{w_l}  |  P&L: {sign}₹{pnl:,.2f}{tag}"
+        )
         self._at_summary_lbl.setStyleSheet(
-            f"color:{pnl_color if placed > 0 else '#484f58'}; font-size:10px;"
+            f"color:{tag_color}; font-size:10px;"
         )
 
     def refresh_positions(self):

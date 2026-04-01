@@ -24,6 +24,7 @@ Logic:
 
 import logging
 import threading
+import concurrent.futures
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta, time as _time
 from typing import Dict, List, Optional, Any
@@ -165,8 +166,37 @@ class TradeSignal:
 
 class SignalAggregator:
     """
-    Evaluates all 8 engines for a given index, produces alerts and signals.
-    Thread-safe.
+    Central orchestrator: runs all engines per tick, produces EarlyMoveAlert
+    and TradeSignal, saves features to DB, and dispatches Telegram/sound alerts.
+
+    Signal pipeline per tick
+    ────────────────────────
+    1. evaluate(index_name, df, chain) — called by DataManager tick thread
+    2. Run 9 engines in parallel (each with 5s timeout + try-catch):
+         Triggering (count toward MIN_ENGINES gate):
+           Compression, DI Momentum, Volume Pressure,
+           Liquidity Trap, Gamma Levels, Market Regime
+         Data-only (ML features only, no gate vote):
+           Option Chain, IV Expansion
+         Context (confidence modifier, not gated):
+           VWAP Pressure, MTF Alignment
+    3. Count triggered engines → if ≥ MIN_ENGINES_FOR_ALERT → EarlyMoveAlert
+    4. Confirm to TradeSignal when:
+         • prior EarlyMoveAlert exists (≤ ALERT_MAX_AGE_CANDLES old)
+         • compression breakout detected
+         • volume spike confirmed
+         • ADX ≥ TRADE_SIGNAL_MIN_ADX, |DI spread| ≥ TRADE_SIGNAL_MIN_DI_SPREAD
+         • MTF alignment = STRONG (both 5m + 15m agree)
+         • regime = TRENDING (if REQUIRE_TRENDING_REGIME)
+         • VIX ≤ MAX_VIX_FOR_SIGNAL (if SIGNAL_BLOCK_ON_HIGH_VIX)
+         • no active calendar event block
+    5. Save ML feature row to DB (every evaluation, labeled later by AutoLabeler)
+    6. Run SetupScreener — 23 named setups, saved to setup_alerts table
+
+    Thread safety
+    ─────────────
+    evaluate() acquires a per-index lock (_lock[index_name]).
+    All other public methods are read-only and lock-free.
     """
 
     def __init__(self):
@@ -212,6 +242,11 @@ class SignalAggregator:
         # Cross-index correlation — updated each evaluation for ML features.
         self._last_directions: Dict[str, str] = {}  # {index: BULLISH|BEARISH|NEUTRAL}
 
+        # Item 9: Prediction confidence decay cache.
+        # Stores last ML result per index so we can decay it based on time + spot movement.
+        # Format: {index_name: {"prob": float, "direction": str, "ts": datetime, "spot": float}}
+        self._last_ml_cache: Dict[str, dict] = {}
+
         # India VIX — updated by main_window from DataManager each tick.
         self._vix: float = 0.0
 
@@ -240,11 +275,13 @@ class SignalAggregator:
                                         preopen_gap_pct)
 
     def set_vix(self, vix: float):
-        self._vix = vix
+        with self._lock:
+            self._vix = vix
 
     def set_cross_directions(self, directions: dict):
         """Called by main_window after all indices are evaluated."""
-        self._last_directions.update(directions)
+        with self._lock:
+            self._last_directions.update(directions)
 
     def get_last_engine_results(self, index_name: str) -> Optional[dict]:
         """
@@ -282,6 +319,35 @@ class SignalAggregator:
         except Exception:
             return True
 
+    @staticmethod
+    def _is_data_fresh(df) -> bool:
+        """
+        Returns True only when the latest candle in df is recent enough to
+        represent live market data.
+
+        Threshold: CANDLE_INTERVAL_MINUTES × 2 (one full candle of buffer).
+        This handles any case where data stops flowing — holidays, circuit
+        breakers, unexpected halts, broker disconnects — without needing a
+        hard-coded calendar.
+
+        Mock adapter always generates datetime.now() candles so this passes
+        transparently in test mode.
+        """
+        try:
+            if df is None or len(df) == 0:
+                return False
+            last_ts = df["timestamp"].iloc[-1]
+            if hasattr(last_ts, "to_pydatetime"):
+                last_ts = last_ts.to_pydatetime()
+            # Strip timezone if present (df timestamps are tz-naive local time)
+            if hasattr(last_ts, "tzinfo") and last_ts.tzinfo is not None:
+                last_ts = last_ts.replace(tzinfo=None)
+            age_seconds = (datetime.now() - last_ts).total_seconds()
+            max_age = config.CANDLE_INTERVAL_MINUTES * 60 * 2
+            return age_seconds <= max_age
+        except Exception:
+            return True   # fail-open: don't block signals on unexpected errors
+
     def _run_evaluation(self, index_name, df, chain, spot_price,
                         df_5m=None, df_15m=None, prev_close=0.0, futures_df=None,
                         preopen_gap_pct=0.0):
@@ -299,17 +365,33 @@ class SignalAggregator:
         candle_completion_pct = round(secs_into_candle / candle_width_secs, 3)
 
         # ── Run all engines (6 triggering + 2 data-only + VWAP) ──
+        # Each engine is wrapped with a 5s timeout and try-catch so a single
+        # engine crash or hang cannot block/kill the entire evaluation loop.
         prev_chain       = self._prev_chains.get(index_name)
         prev_compression = self._prev_compression.get(index_name)
-        compression_r    = self._compression_engine.evaluate(df)
-        di_r          = self._di_engine.evaluate(df)
-        oc_r          = self._oc_engine.evaluate(chain, prev_chain)
-        vol_r         = self._vol_engine.evaluate(df)
-        liq_r         = self._liq_engine.evaluate(df)
-        gamma_r       = self._gamma_engine.evaluate(chain, prev_chain)
-        iv_r          = self._iv_engine.evaluate(chain, prev_chain)
-        regime_r      = self._regime_engine.evaluate(df)
-        vwap_r        = self._vwap_engine.evaluate(df)
+
+        def _run_engine(fn, *args, default=None):
+            """Run fn(*args) with a 5s timeout; return default on error/timeout."""
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+                    fut = _ex.submit(fn, *args)
+                    return fut.result(timeout=5)
+            except concurrent.futures.TimeoutError:
+                logger.warning(f"Engine {fn.__self__.__class__.__name__}.evaluate() timed out (5s) for {index_name}")
+                return default
+            except Exception as _e:
+                logger.error(f"Engine {fn.__self__.__class__.__name__}.evaluate() error for {index_name}: {_e}")
+                return default
+
+        compression_r = _run_engine(self._compression_engine.evaluate, df,           default=CompressionResult())
+        di_r          = _run_engine(self._di_engine.evaluate,          df,           default=DIMomentumResult())
+        oc_r          = _run_engine(self._oc_engine.evaluate,          chain, prev_chain, default=OptionChainResult())
+        vol_r         = _run_engine(self._vol_engine.evaluate,         df,           default=VolumePressureResult())
+        liq_r         = _run_engine(self._liq_engine.evaluate,         df,           default=LiquidityTrapResult())
+        gamma_r       = _run_engine(self._gamma_engine.evaluate,       chain, prev_chain, default=GammaLevelsResult())
+        iv_r          = _run_engine(self._iv_engine.evaluate,          chain, prev_chain, default=IVExpansionResult())
+        regime_r      = _run_engine(self._regime_engine.evaluate,      df,           default=MarketRegimeResult())
+        vwap_r        = _run_engine(self._vwap_engine.evaluate,        df,           default=VWAPResult())
 
         # Store prev chain and compression for trend comparisons on next tick
         if chain:
@@ -320,6 +402,15 @@ class SignalAggregator:
         # Previously it fired AFTER all 8 engine signals were already persisted,
         # which filled the DB with off-hours noise. Now we skip writes entirely.
         if not self._in_market_hours(index_name):
+            self._active_alerts.pop(index_name, None)
+            return None
+
+        # ── Data freshness guard ───────────────────────────────────
+        # Block signals if the latest candle is older than 2× candle interval.
+        # This automatically handles holidays, circuit breakers, unexpected
+        # halts, and broker disconnects — no hard-coded calendar needed.
+        # Mock adapter always stamps candles with datetime.now() so passes freely.
+        if not self._is_data_fresh(df):
             self._active_alerts.pop(index_name, None)
             return None
 
@@ -422,6 +513,21 @@ class SignalAggregator:
         # Shared features for ML
         atr = float(df.iloc[-1]["atr"]) if df is not None and len(df) > 0 else 0.0
         pcr = float(chain.pcr) if chain else 0.0
+        # Setup win rate + mins_since_last_signal — computed once, shared by _save_ml_features
+        # and _get_ml_prediction so both the stored record and the live prediction are consistent.
+        _setup_win_rate = 0.0
+        try:
+            _wr_map = self._db.get_rolling_setup_win_rates(index_name, lookback=20)
+            if _wr_map:
+                _setup_win_rate = max(_wr_map.values())
+        except Exception:
+            pass
+        _last_ts_for_mins = self._last_trade_signal_time.get(index_name)
+        _mins_since_last  = (
+            max(0.0, (now - _last_ts_for_mins).total_seconds() / 60.0)
+            if _last_ts_for_mins else 0.0
+        )
+
         raw_features = {
             "compression":     compression_r.features,
             "di_momentum":     di_r.features,
@@ -437,7 +543,16 @@ class SignalAggregator:
             "atr": atr,
             "pcr": pcr,
             "candle_completion_pct": candle_completion_pct,
+            # Performance context — available to _get_ml_prediction and _save_ml_features
+            "index_name":             index_name,
+            "setup_win_rate":         round(_setup_win_rate, 1),
+            "mins_since_last_signal": round(_mins_since_last, 1),
         }
+
+        # ── ML prediction — computed ONCE per tick, reused below ──
+        # Cached here so the early-alert object, the DB save, and the
+        # trade-signal gate all use the identical result without triple-calling.
+        _tick_ml_pred = self._get_ml_prediction(raw_features, consensus_direction)
 
         # ── Early Move Alert: N+ engines aligned ──────────────────
         existing_alert = self._active_alerts.get(index_name)
@@ -483,7 +598,7 @@ class SignalAggregator:
             alert.mtf_bias_15m    = mtf_r.bias_15m
             alert.mtf_score_delta = mtf_r.score_delta
             # ── ML Augmentation ───────────────────────────────────
-            alert.ml_prediction = self._get_ml_prediction(raw_features, consensus_direction)
+            alert.ml_prediction = _tick_ml_pred
 
             # ── Early Alert DB gate ───────────────────────────────────
             # UI always gets the alert object (live scanner updates every tick).
@@ -508,7 +623,7 @@ class SignalAggregator:
             )
 
             if _is_new_alert:
-                _ml_pred = self._get_ml_prediction(raw_features, consensus_direction)
+                _ml_pred = _tick_ml_pred
                 alert_id = self._db.save_alert({
                     "index_name": index_name,
                     "timestamp": now,
@@ -645,10 +760,6 @@ class SignalAggregator:
 
             # Volume confirmation — relaxed for cash indices (volume often 0 from broker).
             # Accept: actual spike OR volume engine triggered OR range expansion alone.
-            _vol_ok = (vol_r.volume_spike
-                       or vol_r.is_triggered
-                       or _range_ok)
-
             # Per-index+direction cooldown — check BEFORE any DB write.
             _ts_key  = f"{index_name}:{consensus_direction}"
             _last_ts = self._last_trade_signal_time.get(_ts_key)
@@ -680,11 +791,25 @@ class SignalAggregator:
 
             # ML gate: compute prediction before gate check so it can block signals.
             # Only active in Phase 2 (model trained). Phase 1 = no model = always pass.
-            _ml_pred = self._get_ml_prediction(raw_features, consensus_direction)
+            # Uses session-specific threshold: opening session (1) is stricter (0.55)
+            # than morning/midday (2/3) which use the base 0.50.
+            _ml_pred = _tick_ml_pred
+            _now_ist_h = datetime.now(_IST).hour
+            _now_ist_m = datetime.now(_IST).minute
+            if   _now_ist_h < 9 or (_now_ist_h == 9 and _now_ist_m < 30): _session_now = 0
+            elif _now_ist_h == 9 or (_now_ist_h == 10 and _now_ist_m == 0): _session_now = 1
+            elif _now_ist_h < 12: _session_now = 2
+            elif _now_ist_h < 14: _session_now = 3
+            else: _session_now = 4
+            _session_thresholds = getattr(config, "ML_SESSION_GATE_THRESHOLDS", {})
+            _ml_threshold = _session_thresholds.get(
+                _session_now,
+                getattr(config, "ML_SIGNAL_GATE_THRESHOLD", 0.50)
+            )
             _ml_gate_ok = (
                 _ml_pred is None
                 or not _ml_pred.is_available
-                or _ml_pred.probability >= getattr(config, "ML_SIGNAL_GATE_THRESHOLD", 0.45)
+                or _ml_pred.probability >= _ml_threshold
             )
 
             # ── Event calendar gate ───────────────────────────────
@@ -767,7 +892,7 @@ class SignalAggregator:
                         f"vol_ratio={_vol_ratio:.2f}(ok={_vol_ratio_ok}) "
                         f"pcr={pcr:.2f}(ok={_pcr_ok}) "
                         f"index_blocked={_index_blocked} strict_ok={_strict_conf_ok} "
-                        f"ml_prob={_ml_prob}(ok={_ml_gate_ok}) "
+                        f"ml_prob={_ml_prob}(thr={_ml_threshold:.2f},ok={_ml_gate_ok}) "
                         f"event_ok={_event_ok} vix={self._vix:.1f}(ok={_vix_ok}) "
                         f"regime={_regime_label}(trending_ok={_trending_ok}) "
                         f"dir_filter={_allowed_dir or 'any'}(ok={_direction_ok}) "
@@ -967,17 +1092,19 @@ class SignalAggregator:
         except Exception:
             return "NEUTRAL"
 
-    @staticmethod
-    def _get_ml_prediction(raw_features: dict, direction: str):
+    def _get_ml_prediction(self, raw_features: dict, direction: str):
         """
         Build a flat feature dict for ML prediction.
 
+        Item 9: applies confidence decay to stale cached predictions.
+        A cached prediction is stale when:
+          - More than 3 candle-lengths have elapsed (≥ 9 min for 3-min candles), OR
+          - Spot has moved more than 1× ATR since the prediction was made.
+        When stale, probability decays toward 0.5 (neutral) linearly.
+        A fresh inference always replaces the cache.
+
         Uses explicit per-engine key mapping (same as _save_ml_features) to avoid
         silent overwrites when two engine feature dicts share a key name.
-        Known collisions prevented:
-          "iv_rank"      — option_chain AND iv_expansion both expose this key
-          "volume_ratio" — volume_pressure AND liquidity_trap both expose this key
-          "adx"          — di_momentum AND market_regime both expose this key
         """
         try:
             from ml.model_manager import get_model_manager
@@ -1048,8 +1175,63 @@ class SignalAggregator:
                 # Top-level scalars
                 "spot_price":              raw_features.get("spot_price", 0),
                 "candle_completion_pct":   raw_features.get("candle_completion_pct", 0),
+                # Group I: Historical performance context (pre-computed, passed through raw_features)
+                "setup_win_rate":          raw_features.get("setup_win_rate", 0.0),
+                "mins_since_last_signal":  raw_features.get("mins_since_last_signal", 0.0),
             }
-            return get_model_manager().predict(flat, direction)
+            index_name  = raw_features.get("index_name", "")
+            current_spot = raw_features.get("spot_price", 0.0)
+            current_atr  = flat.get("atr", 20.0) or 20.0
+            now          = datetime.now()
+
+            prediction = get_model_manager().predict(flat, direction, index_name=index_name)
+
+            # ── Item 9: Cache + decay ────────────────────────────
+            # Always store the freshly computed prediction.
+            if prediction and prediction.is_available:
+                self._last_ml_cache[index_name] = {
+                    "prob":      prediction.probability,
+                    "direction": direction,
+                    "ts":        now,
+                    "spot":      current_spot,
+                    "atr":       current_atr,
+                }
+            elif index_name in self._last_ml_cache:
+                # No fresh inference available — apply decay to the cached result.
+                cached     = self._last_ml_cache[index_name]
+                elapsed_s  = (now - cached["ts"]).total_seconds()
+                max_age_s  = config.CANDLE_INTERVAL_MINUTES * 60 * 3   # 3 candles
+                spot_move  = abs(current_spot - cached["spot"]) if current_spot > 0 else 0.0
+                atr_moved  = spot_move / cached["atr"] if cached["atr"] > 0 else 0.0
+
+                # Decay factor: 0.0 = fully fresh, 1.0 = fully stale (prob → 0.5)
+                time_decay  = min(1.0, elapsed_s / max(max_age_s, 1))
+                spot_decay  = min(1.0, atr_moved)          # 1 ATR move = fully stale
+                decay       = max(time_decay, spot_decay)
+
+                if decay > 0.1:   # only decay if meaningfully stale
+                    orig_prob    = cached["prob"]
+                    decayed_prob = orig_prob + decay * (0.5 - orig_prob)
+                    # Re-emit the cached prediction with decayed probability
+                    if prediction and not prediction.is_available:
+                        # Construct a decayed copy only if direction still matches
+                        if cached["direction"] == direction and decay < 1.0:
+                            from ml.model_manager import MLPrediction
+                            decayed_conf = round(decayed_prob * 100, 1)
+                            rec = (f"STRONG_{direction}" if decayed_prob >= 0.70
+                                   else f"MODERATE_{direction}" if decayed_prob >= 0.55
+                                   else "WEAK_SIGNAL" if decayed_prob >= 0.45
+                                   else "LOW_CONFIDENCE")
+                            prediction = MLPrediction(
+                                is_available  = True,
+                                probability   = decayed_prob,
+                                ml_confidence = decayed_conf,
+                                recommendation= rec,
+                                direction     = direction,
+                                phase         = 2,
+                            )
+
+            return prediction
         except Exception as e:
             import logging; logging.getLogger(__name__).debug(f"ML prediction skipped: {e}")
             return None
@@ -1313,7 +1495,7 @@ class SignalAggregator:
         # fair value = spot × risk_free_rate × (dte / 365)
         # Raw basis at DTE=20 is ~0.35% just from fair value → not a signal.
         # Excess strips that out: +ve = institutional long bias, -ve = short/hedge bias.
-        _RISK_FREE_RATE_PCT = 6.5     # India 10Y approx, in percent
+        _RISK_FREE_RATE_PCT = config.RISK_FREE_RATE * 100  # convert 0.065 → 6.5
         excess_basis_pct    = 0.0
         futures_basis_slope = 0.0   # 5-candle slope of raw basis — DTE-neutral (slope of constant = 0)
         oi_regime           = -1    # -1=unknown, 0=long_buildup, 1=short_buildup,
@@ -1439,6 +1621,24 @@ class SignalAggregator:
         vix       = self._vix
         vix_high  = int(vix >= 15.0) if vix > 0 else 0
 
+        # ── Group I: Historical performance context ───────────────
+        # Both values are pre-computed in _run_evaluation and stored in raw_features.
+        # _save_ml_features receives them via the raw_features['_context'] path,
+        # or can be re-derived from the aggregator state here.
+        # Using the aggregator state directly (same values that were stored in raw_features).
+        setup_win_rate = 0.0
+        try:
+            _wr_map = self._db.get_rolling_setup_win_rates(index_name, lookback=20)
+            if _wr_map:
+                setup_win_rate = max(_wr_map.values())
+        except Exception:
+            pass
+
+        mins_since_last_signal = 0.0
+        _last_ts = self._last_trade_signal_time.get(index_name)
+        if _last_ts:
+            mins_since_last_signal = max(0.0, (timestamp - _last_ts).total_seconds() / 60.0)
+
         self._db.save_ml_features({
             "alert_id": alert_id,
             "index_name": index_name,
@@ -1488,7 +1688,7 @@ class SignalAggregator:
             "iv_skew_ratio": iv.features.get("iv_skew_ratio", 1.0),
             "avg_atm_iv": iv.features.get("avg_atm_iv", 0),
             "iv_change_pct": iv.features.get("iv_change_pct", 0),
-            # Engine 7-new: VWAP Pressure
+            # Engine 9: VWAP Pressure
             "vwap":             vwap.features.get("vwap", 0) if vwap else 0,
             "dist_to_vwap_pct": vwap.features.get("dist_to_vwap_pct", 0) if vwap else 0,
             "vwap_cross_up":    vwap.features.get("vwap_cross_up", False) if vwap else False,
@@ -1569,6 +1769,9 @@ class SignalAggregator:
             "direction_encoded": 1 if consensus_direction == "BULLISH" else -1,
             "index_encoded": self._INDEX_ENCODING.get(index_name, 4),
             "is_trade_signal": is_trade_signal,
+            # Group J: Historical performance context
+            "setup_win_rate":          round(setup_win_rate, 1),
+            "mins_since_last_signal":  round(mins_since_last_signal, 1),
             "label": -1,  # Unlabeled — auto_labeler assigns later
             "label_direction": 0,
         })

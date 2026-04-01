@@ -27,51 +27,19 @@ import numpy as np
 
 import config
 from data.structures import OptionChain
+from data.bs_utils import bs_iv as _bs_iv
 
 logger = logging.getLogger(__name__)
 
-# ── Black-Scholes IV solver ────────────────────────────────────────
-# Used when broker does not return IV (e.g. Fyers option chain API).
-# Computes implied volatility from option LTP using Newton-Raphson.
-
-_RISK_FREE_RATE = 0.065  # 6.5% — RBI repo rate approximation
-
-
-def _norm_cdf(x: float) -> float:
-    """Standard normal CDF via math.erf (no scipy needed)."""
-    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
-
-
-def _norm_pdf(x: float) -> float:
-    """Standard normal PDF."""
-    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
-
-
-def _bs_price(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
-    """Black-Scholes option price."""
-    if sigma <= 0 or T <= 0:
-        return max(0.0, (S - K) if is_call else (K - S))
-    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    if is_call:
-        return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
-    else:
-        return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
-
-
-def _bs_vega(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    """Black-Scholes vega (same for calls and puts)."""
-    if sigma <= 0 or T <= 0:
-        return 1e-10
-    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
-    return S * math.sqrt(T) * _norm_pdf(d1)
+_RISK_FREE_RATE = config.RISK_FREE_RATE  # defined in config.py
 
 
 def compute_iv(option_ltp: float, spot: float, strike: float,
                expiry_str: str, is_call: bool,
                r: float = _RISK_FREE_RATE) -> float:
     """
-    Newton-Raphson implied volatility from option LTP.
+    Implied volatility from option LTP.
+    Delegates to bs_utils.bs_iv (Brent root-finding, canonical solver).
     Returns IV as a percentage (e.g. 15.5 for 15.5%), or 0.0 if unsolvable.
 
     expiry_str formats accepted: "27MAR2025", "2025-03-27", "27-Mar-2025".
@@ -84,7 +52,7 @@ def compute_iv(option_ltp: float, spot: float, strike: float,
     for fmt in ("%d%b%Y", "%Y-%m-%d", "%d-%b-%Y", "%d%b%y"):
         try:
             exp_date = datetime.strptime(expiry_str.strip().upper(), fmt.upper()).date()
-            days_left = max(1, (exp_date - date.today()).days)  # floor at 1 day
+            days_left = max(1, (exp_date - date.today()).days)
             T = days_left / 365.0
             break
         except ValueError:
@@ -92,25 +60,8 @@ def compute_iv(option_ltp: float, spot: float, strike: float,
     if T <= 0:
         T = 7.0 / 365.0  # fallback: 1 week
 
-    # Intrinsic value check
-    intrinsic = max(0.0, (spot - strike) if is_call else (strike - spot))
-    if option_ltp < intrinsic * 0.95:
-        return 0.0  # price below intrinsic — data error
-
-    sigma = 0.20  # initial guess: 20%
-    for _ in range(100):
-        price = _bs_price(spot, strike, T, r, sigma, is_call)
-        vega  = _bs_vega(spot, strike, T, r, sigma)
-        diff  = price - option_ltp
-        if abs(diff) < 0.01:
-            break
-        if abs(vega) < 1e-8:
-            break
-        sigma -= diff / vega
-        if sigma <= 0.001 or sigma > 5.0:  # IV above 500% — unsolvable
-            return 0.0
-
-    return round(max(0.0, sigma * 100.0), 2)
+    opt_type = "CE" if is_call else "PE"
+    return _bs_iv(option_ltp, spot, strike, T, r, opt_type)
 
 
 @dataclass

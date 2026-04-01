@@ -92,11 +92,12 @@ QCheckBox::indicator:checked { background:#1f6feb; border-color:#1f6feb; }
 
 
 class DataBridge(QObject):
-    data_updated    = Signal()
-    alert_received  = Signal(object)
-    model_updated   = Signal(object)
-    engine_result   = Signal(str, int, float, str, str, str)  # idx, count, conf, b5, b15, align
-    outcome_updated = Signal(int, str)                         # outcome_id, outcome_str
+    data_updated          = Signal()
+    alert_received        = Signal(object)
+    model_updated         = Signal(object)
+    engine_result         = Signal(str, int, float, str, str, str)  # idx, count, conf, b5, b15, align
+    outcome_updated       = Signal(int, str)                         # outcome_id, outcome_str
+    s11_position_changed  = Signal()                                 # fired on S11 open/close
 
 
 class MainWindow(QMainWindow):
@@ -168,6 +169,9 @@ class MainWindow(QMainWindow):
         self._ledger_tab.set_db(get_db())
         self._ledger_tab.set_order_manager(self._order_manager)
 
+        # Wire DB into order manager for paper trade persistence
+        self._order_manager.set_db(get_db())
+
         # Wire S11 tab with its monitor
         self._s11_tab.set_monitor(self._s11_monitor)
 
@@ -232,6 +236,10 @@ class MainWindow(QMainWindow):
         self._bridge.engine_result.connect(self._dashboard_tab.set_engine_result)
         self._bridge.outcome_updated.connect(self._alerts_tab.refresh_outcome)
         self._bridge.outcome_updated.connect(self._hq_tab.refresh_outcome)
+        # Wire S11Monitor position-change callbacks → S11Tab refresh (thread-safe via signal)
+        self._bridge.s11_position_changed.connect(self._s11_tab.refresh)
+        self._s11_monitor._on_open  = lambda _: self._bridge.s11_position_changed.emit()
+        self._s11_monitor._on_close = lambda _: self._bridge.s11_position_changed.emit()
 
         self._dm.add_update_callback(lambda: self._bridge.data_updated.emit())
         self._am.add_ui_callback(lambda a: self._bridge.alert_received.emit(a))
@@ -459,91 +467,15 @@ class MainWindow(QMainWindow):
         from engines.signal_aggregator import TradeSignal
         is_confirmed = getattr(alert_obj, "is_confirmed", False)
 
-        # Save CONFIRMED_SIGNAL to DB so it's in the history
+        # Confirmed signals: DB save + setup alerts + outcome tracker + auto trade.
+        # Runs in a daemon thread so DB writes don't block the GUI event loop.
         if is_confirmed and isinstance(alert_obj, TradeSignal):
-            try:
-                from database.manager import get_db
-                _db = get_db()
-                cid = _db.save_alert({
-                    "index_name":        alert_obj.index_name,
-                    "timestamp":         alert_obj.timestamp,
-                    "alert_type":        "CONFIRMED_SIGNAL",
-                    "direction":         alert_obj.direction,
-                    "confidence_score":  alert_obj.confidence_score,
-                    "engines_triggered": alert_obj.engines_triggered,
-                    "engines_count":     len(alert_obj.engines_triggered),
-                    "spot_price":        alert_obj.spot_price,
-                    "atm_strike":        alert_obj.atm_strike,
-                    "pcr":               alert_obj.pcr,
-                    "atr":               alert_obj.atr,
-                    "suggested_instrument": alert_obj.suggested_instrument,
-                    "entry_reference":   alert_obj.entry_reference,
-                    "stop_loss_reference": alert_obj.stop_loss_reference,
-                    "target_reference":  alert_obj.target_reference,
-                    "raw_features":      getattr(alert_obj, "raw_features", {}),
-                })
-                alert_obj.alert_id = cid
-
-                # Save setup_alerts for CONFIRMED_SIGNAL so per-setup stats
-                # capture the highest-quality outcome (candle-close confirmed).
-                try:
-                    from engines.setup_screener import SetupScreener
-                    _screener = self._sa._setup_screener
-                    _chain = self._dm.get_option_chain(alert_obj.index_name)
-                    _df    = self._dm.get_df(alert_obj.index_name)
-                    _df5   = self._dm.get_df_5m(alert_obj.index_name)
-                    _df15  = self._dm.get_df_15m(alert_obj.index_name)
-                    # Re-evaluate using cached engine results from the last tick
-                    _cached = self._sa.get_last_engine_results(alert_obj.index_name)
-                    if _cached and cid:
-                        _conf_hits = _screener.evaluate(
-                            index_name=alert_obj.index_name,
-                            direction=alert_obj.direction,
-                            timestamp=alert_obj.timestamp,
-                            spot_price=alert_obj.spot_price,
-                            atr=alert_obj.atr,
-                            engines_count=len(getattr(alert_obj, "engines_triggered", [])),
-                            di_r=_cached["di_r"],
-                            vol_r=_cached["vol_r"],
-                            oc_r=_cached["oc_r"],
-                            regime_r=_cached["regime_r"],
-                            vwap_r=_cached["vwap_r"],
-                            mtf_r=_cached["mtf_r"],
-                            pcr=alert_obj.pcr,
-                        )
-                        if _conf_hits:
-                            _db.save_setup_alerts(_conf_hits, alert_id=cid)
-                except Exception as _se:
-                    logger.debug(f"SetupScreener (confirmed) save failed: {_se}")
-
-                # Register confirmed signal with outcome tracker so its row
-                # gets WIN/LOSS/SL outcome instead of staying OPEN forever.
-                try:
-                    self._outcome_tracker.register(alert_obj, cid)
-                except Exception as e:
-                    logger.error(f"OutcomeTracker register (confirmed) error: {e}")
-
-                # ── Layer 1 auto trading: place bracket order ──────
-                if (config.AUTO_TRADE_CONFIRMED_ONLY
-                        and self._order_manager.is_enabled()):
-                    try:
-                        # Pass chain expiry AND current live option LTP so
-                        # OrderManager uses the candle-close price, not the
-                        # stale entry_reference from signal generation time.
-                        chain = self._dm.get_option_chain(alert_obj.index_name)
-                        expiry = chain.expiry if chain else ""
-                        live_ltp = self._current_option_ltp(chain, alert_obj)
-                        oid = self._order_manager.place_order(
-                            alert_obj, expiry=expiry, live_ltp=live_ltp)
-                        if oid:
-                            logger.info(
-                                f"Auto order placed [{alert_obj.index_name}] "
-                                f"{alert_obj.direction} → {oid}"
-                            )
-                    except Exception as e:
-                        logger.error(f"AutoTrade place_order error: {e}")
-            except Exception as e:
-                logger.error(f"Confirmed signal DB save error: {e}")
+            import threading as _threading
+            _threading.Thread(
+                target=self._process_confirmed_signal,
+                args=(alert_obj,),
+                daemon=True,
+            ).start()
 
         # ── Layer 1 auto trade for non-confirmed signals ───────────
         # Only when AUTO_TRADE_CONFIRMED_ONLY is False (fires on raw TRADE_SIGNAL)
@@ -587,6 +519,86 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.debug(f"Scanner log row error: {e}")
 
+    def _process_confirmed_signal(self, alert_obj):
+        """Off-GUI-thread: DB save + outcome tracker + auto trade for confirmed signals."""
+        try:
+            from database.manager import get_db
+            _db = get_db()
+            cid = _db.save_alert({
+                "index_name":        alert_obj.index_name,
+                "timestamp":         alert_obj.timestamp,
+                "alert_type":        "CONFIRMED_SIGNAL",
+                "direction":         alert_obj.direction,
+                "confidence_score":  alert_obj.confidence_score,
+                "engines_triggered": alert_obj.engines_triggered,
+                "engines_count":     len(alert_obj.engines_triggered),
+                "spot_price":        alert_obj.spot_price,
+                "atm_strike":        alert_obj.atm_strike,
+                "pcr":               alert_obj.pcr,
+                "atr":               alert_obj.atr,
+                "suggested_instrument": alert_obj.suggested_instrument,
+                "entry_reference":   alert_obj.entry_reference,
+                "stop_loss_reference": alert_obj.stop_loss_reference,
+                "target_reference":  alert_obj.target_reference,
+                "raw_features":      getattr(alert_obj, "raw_features", {}),
+            })
+            alert_obj.alert_id = cid
+
+            # Save setup_alerts for CONFIRMED_SIGNAL so per-setup stats
+            # capture the highest-quality outcome (candle-close confirmed).
+            try:
+                _screener = self._sa._setup_screener
+                _cached = self._sa.get_last_engine_results(alert_obj.index_name)
+                if _cached and cid:
+                    _conf_hits = _screener.evaluate(
+                        index_name=alert_obj.index_name,
+                        direction=alert_obj.direction,
+                        timestamp=alert_obj.timestamp,
+                        spot_price=alert_obj.spot_price,
+                        atr=alert_obj.atr,
+                        engines_count=len(getattr(alert_obj, "engines_triggered", [])),
+                        di_r=_cached["di_r"],
+                        vol_r=_cached["vol_r"],
+                        oc_r=_cached["oc_r"],
+                        regime_r=_cached["regime_r"],
+                        vwap_r=_cached["vwap_r"],
+                        mtf_r=_cached["mtf_r"],
+                        pcr=alert_obj.pcr,
+                    )
+                    if _conf_hits:
+                        _db.save_setup_alerts(_conf_hits, alert_id=cid)
+            except Exception as _se:
+                logger.debug(f"SetupScreener (confirmed) save failed: {_se}")
+
+            # Register confirmed signal with outcome tracker so its row
+            # gets WIN/LOSS/SL outcome instead of staying OPEN forever.
+            try:
+                self._outcome_tracker.register(alert_obj, cid)
+            except Exception as e:
+                logger.error(f"OutcomeTracker register (confirmed) error: {e}")
+
+            # ── Layer 1 auto trading: place bracket order ──────
+            if (config.AUTO_TRADE_CONFIRMED_ONLY
+                    and self._order_manager.is_enabled()):
+                try:
+                    # Pass chain expiry AND current live option LTP so
+                    # OrderManager uses the candle-close price, not the
+                    # stale entry_reference from signal generation time.
+                    chain = self._dm.get_option_chain(alert_obj.index_name)
+                    expiry = chain.expiry if chain else ""
+                    live_ltp = self._current_option_ltp(chain, alert_obj)
+                    oid = self._order_manager.place_order(
+                        alert_obj, expiry=expiry, live_ltp=live_ltp)
+                    if oid:
+                        logger.info(
+                            f"Auto order placed [{alert_obj.index_name}] "
+                            f"{alert_obj.direction} → {oid}"
+                        )
+                except Exception as e:
+                    logger.error(f"AutoTrade place_order error: {e}")
+        except Exception as e:
+            logger.error(f"Confirmed signal DB save error: {e}")
+
         # Flash Alerts tab
         self._tabs.tabBar().setTabTextColor(4, QColor("#f85149"))
         QTimer.singleShot(
@@ -614,8 +626,7 @@ class MainWindow(QMainWindow):
         from database.manager import get_db
         _db = get_db()
 
-        with self._outcome_tracker._lock:
-            open_states = dict(self._outcome_tracker._open)
+        open_states = self._outcome_tracker.get_open_states()
 
         for outcome_id, state in open_states.items():
             alert_id    = state.get("alert_id")

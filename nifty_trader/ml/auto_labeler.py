@@ -23,11 +23,54 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
-from typing import List, Optional, Dict
+from datetime import datetime, timedelta, date
+from typing import List, Optional, Dict, Set
 
 import config
 from database.manager import get_db
+
+# ── NSE Trading Holiday Calendar ────────────────────────────────
+# Official NSE holidays for 2025-2026. Add new years as needed.
+# Source: NSE India official holiday list.
+_NSE_HOLIDAYS: Set[date] = {
+    # 2025
+    date(2025, 1, 26),  # Republic Day
+    date(2025, 2, 26),  # Mahashivratri
+    date(2025, 3, 14),  # Holi
+    date(2025, 3, 31),  # Id-Ul-Fitr (Ramzan Id)
+    date(2025, 4, 10),  # Shri Ram Navami
+    date(2025, 4, 14),  # Dr. Baba Saheb Ambedkar Jayanti
+    date(2025, 4, 18),  # Good Friday
+    date(2025, 5, 1),   # Maharashtra Day
+    date(2025, 8, 15),  # Independence Day
+    date(2025, 8, 27),  # Ganesh Chaturthi
+    date(2025, 10, 2),  # Mahatma Gandhi Jayanti
+    date(2025, 10, 2),  # Dussehra (same date)
+    date(2025, 10, 20), # Diwali - Laxmi Puja
+    date(2025, 10, 21), # Diwali - Balipratipada
+    date(2025, 11, 5),  # Prakash Gurpurb Sri Guru Nanak Dev Ji
+    date(2025, 12, 25), # Christmas
+    # 2026
+    date(2026, 1, 26),  # Republic Day
+    date(2026, 3, 19),  # Holi
+    date(2026, 3, 20),  # Holi
+    date(2026, 4, 1),   # Id-Ul-Fitr (Ramzan Id) — Clearing Holiday
+    date(2026, 4, 3),   # Shri Ram Navami
+    date(2026, 4, 14),  # Dr. Baba Saheb Ambedkar Jayanti
+    date(2026, 4, 17),  # Good Friday
+    date(2026, 5, 1),   # Maharashtra Day
+    date(2026, 8, 15),  # Independence Day
+    date(2026, 10, 2),  # Mahatma Gandhi Jayanti
+    date(2026, 12, 25), # Christmas
+}
+
+
+def _is_trading_day(dt: datetime) -> bool:
+    """Return True if dt falls on a weekday that is not an NSE market holiday."""
+    d = dt.date() if isinstance(dt, datetime) else dt
+    if d.weekday() >= 5:   # Saturday=5, Sunday=6
+        return False
+    return d not in _NSE_HOLIDAYS
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +85,7 @@ T3_ATR_THRESHOLD          = 2.5   # T3-equivalent move
 SL_ATR_THRESHOLD          = 0.5   # SL-equivalent adverse move
 
 # Run labeling every N seconds (configurable via config.AUTO_LABEL_INTERVAL_SECONDS)
-LABEL_INTERVAL_SECONDS = getattr(__import__("config"), "AUTO_LABEL_INTERVAL_SECONDS", 900)
+LABEL_INTERVAL_SECONDS = getattr(config, "AUTO_LABEL_INTERVAL_SECONDS", 900)
 
 
 class AutoLabeler:
@@ -85,8 +128,17 @@ class AutoLabeler:
             try:
                 count = self._label_pending()
                 if count > 0:
-                    logger.info(f"AutoLabeler: labeled {count} records")
                     self._label_count += count
+                    stats = self.get_label_stats()
+                    logger.info(
+                        f"AutoLabeler: labeled {count} records "
+                        f"(total={stats['labeled']} "
+                        f"P1={stats['source_p1_trade_outcome']} "
+                        f"P2={stats['source_p2_cross_link']} "
+                        f"P3={stats['source_p3_option_chain']} "
+                        f"P4={stats['source_p4_atr_heuristic']} "
+                        f"high_quality={stats['high_quality_pct']}%)"
+                    )
             except Exception as e:
                 logger.error(f"AutoLabeler error: {e}")
             time.sleep(LABEL_INTERVAL_SECONDS)
@@ -148,6 +200,14 @@ class AutoLabeler:
                 ).all():
                     alerts_by_id[a.id] = a
 
+            # ── Skip records whose timestamp falls on a market holiday ──────
+            # Candles generated on holidays are stale data re-stamped by the
+            # broker — labeling them creates incorrect SL/T1 outcomes because
+            # the "future" candles belong to a different trading session.
+            pending = [r for r in pending if _is_trading_day(r.timestamp)]
+            if not pending:
+                return 0
+
             # ── Batch pre-load 3: future candles + chain snapshots per index ──
             lookahead_mins = config.CANDLE_INTERVAL_MINUTES * LABEL_LOOKAHEAD_CANDLES
             by_index: Dict[str, list] = defaultdict(list)
@@ -164,7 +224,9 @@ class AutoLabeler:
             for idx, records in by_index.items():
                 min_ts = min(r.timestamp for r in records)
                 max_ts = max(r.timestamp for r in records) + timedelta(minutes=lookahead_mins)
-                candles_map[idx] = session.query(MarketCandle).filter(
+                # Exclude candles that fall on market holidays so lookahead
+                # doesn't bleed into a different trading session's price action.
+                raw_candles = session.query(MarketCandle).filter(
                     and_(
                         MarketCandle.index_name == idx,
                         MarketCandle.timestamp  >  min_ts,
@@ -172,6 +234,7 @@ class AutoLabeler:
                         MarketCandle.is_futures == False,  # noqa: E712
                     )
                 ).order_by(MarketCandle.timestamp).all()
+                candles_map[idx] = [c for c in raw_candles if _is_trading_day(c.timestamp)]
                 # Option chain snapshots — used to read real option LTPs
                 chain_map[idx] = session.query(OptionChainSnapshot).filter(
                     and_(
@@ -200,9 +263,10 @@ class AutoLabeler:
 
                 result = self._compute_label_cached(record, outcome, alert, candles, chains, nearby)
                 if result is not None:
-                    label, quality = result
+                    label, quality, source = result
                     record.label         = label
                     record.label_quality = quality
+                    record.label_source  = source
                     record.label_direction = self._direction_from_label(label, alert)
                     labeled += 1
 
@@ -234,9 +298,10 @@ class AutoLabeler:
         """
         Compute label from pre-loaded data — no DB queries inside.
 
-        Returns Optional[Tuple[int, int]] = (label, label_quality) where:
+        Returns Optional[Tuple[int, int, int]] = (label, label_quality, label_source) where:
           label         1 = valid move, 0 = false signal
           label_quality 0 = SL_hit, 1 = T1_hit, 2 = T2_hit, 3 = T3_hit
+          label_source  1 = TradeOutcome, 2 = CrossLink, 3 = OptionChain, 4 = ATR Heuristic
 
         Priority:
           1. Real TradeOutcome data (SL/T1/T2/T3 hit) — actual option P&L.
@@ -249,18 +314,18 @@ class AutoLabeler:
             has_post_close = outcome.post_close_eod_spot is not None
             if outcome.sl_hit:
                 if has_post_close and outcome.post_sl_full_recovery:
-                    return (1, 1)  # SL hit but fully recovered to T3+ → count as T1
+                    return (1, 1, 1)  # SL hit but fully recovered to T3+ → count as T1
                 if has_post_close and outcome.post_sl_reversal:
-                    return (1, 1)  # SL hit but recovered to T1+ → marginal win
-                return (0, 0)      # Clean SL hit → loss
+                    return (1, 1, 1)  # SL hit but recovered to T1+ → marginal win
+                return (0, 0, 1)      # Clean SL hit → loss
             if outcome.t3_hit:
-                return (1, 3)
+                return (1, 3, 1)
             if outcome.t2_hit:
-                return (1, 2)
+                return (1, 2, 1)
             if outcome.t1_hit:
-                return (1, 1)
+                return (1, 1, 1)
             if outcome.eod_spot is not None:
-                return (0, 0)
+                return (0, 0, 1)
             # Outcome row exists but post-close data not yet written → fall through
 
         # ── Priority 2: cross-link with nearby closed TradeOutcome ──
@@ -272,13 +337,13 @@ class AutoLabeler:
             nearby = self._find_nearby_outcome(record, record_dir, nearby_outcomes)
             if nearby is not None:
                 if nearby.t3_hit:
-                    return (1, 3)
+                    return (1, 3, 2)
                 if nearby.t2_hit:
-                    return (1, 2)
+                    return (1, 2, 2)
                 if nearby.t1_hit:
-                    return (1, 1)
+                    return (1, 1, 2)
                 if nearby.sl_hit:
-                    return (0, 0)
+                    return (0, 0, 2)
 
         # ── Priority 3: option chain LTP vs SL/T1/T2/T3 levels ───
         # Only for trade/confirmed signals with a known instrument and price levels.
@@ -290,7 +355,8 @@ class AutoLabeler:
                 and getattr(alert, "target_reference", None)):
             opt_result = self._label_from_option_chain(record, alert, all_chains)
             if opt_result is not None:
-                return opt_result
+                label3, quality3 = opt_result
+                return (label3, quality3, 3)
 
         # ── Priority 4: ATR-tiered heuristic on spot price ────────
         # Grades the move quality using ATR multiples:
@@ -312,7 +378,7 @@ class AutoLabeler:
 
         direction = alert.direction if alert else None
         if not direction:
-            return (0, 0)
+            return (0, 0, 4)
 
         entry_price  = future_candles[0].open
         max_fav      = 0.0   # max favorable move
@@ -326,13 +392,13 @@ class AutoLabeler:
                 max_adverse = max(max_adverse, candle.high - entry_price)
 
         if max_fav >= atr * T3_ATR_THRESHOLD:
-            return (1, 3)
+            return (1, 3, 4)
         if max_fav >= atr * T2_ATR_THRESHOLD:
-            return (1, 2)
+            return (1, 2, 4)
         if max_fav >= atr * VALID_MOVE_ATR_THRESHOLD:
-            return (1, 1)
+            return (1, 1, 4)
         # No significant favorable move — label as false signal
-        return (0, 0)
+        return (0, 0, 4)
 
     @staticmethod
     def _find_nearby_outcome(record, record_direction, nearby_outcomes,
@@ -386,10 +452,14 @@ class AutoLabeler:
         if entry <= 0 or sl <= 0 or t1 <= 0 or sl >= entry or t1 <= entry:
             return None
 
-        # Compute T2 and T3 from the risk unit (1R = t1 - entry)
+        # Compute T2 and T3 using the same ATR multiples as OutcomeTracker:
+        #   T1 = entry ± 1.0× ATR  →  1R = t1 - entry
+        #   T2 = entry ± 1.5× ATR  →  T2 = entry + risk × 1.5
+        #   T3 = entry ± 2.2× ATR  →  T3 = entry + risk × 2.2
+        # This aligns P3 option-chain labels with real TradeOutcome (P1) labels.
         risk = t1 - entry          # 1R in option price terms
-        t2   = entry + risk * 2.0  # 2R above entry
-        t3   = entry + risk * 3.0  # 3R above entry
+        t2   = entry + risk * 1.5  # matches OUTCOME_T2_ATR_MULT / OUTCOME_T1_ATR_MULT
+        t3   = entry + risk * 2.2  # matches OUTCOME_T3_ATR_MULT / OUTCOME_T1_ATR_MULT
 
         ts        = record.timestamp
         lookahead = timedelta(minutes=config.CANDLE_INTERVAL_MINUTES * LABEL_LOOKAHEAD_CANDLES)
@@ -428,17 +498,24 @@ class AutoLabeler:
 
     @staticmethod
     def _direction_from_label(label: int, alert) -> int:
-        """Returns +1 (bullish), -1 (bearish), or 0 (no move)."""
-        if label == 0 or alert is None:
+        """Returns +1 (bullish), -1 (bearish), or 0 (no move / unknown).
+
+        For wins (label=1): direction = predicted direction (signal was correct).
+        For losses (label=0): direction = OPPOSITE of predicted signal, because
+            SL was hit meaning price moved against the prediction. This lets the
+            model learn the difference between "wrong direction" and "right direction,
+            SL too tight" (the latter is captured by post_sl_reversal flag separately).
+        """
+        if alert is None:
             return 0
         if alert.direction == "BULLISH":
-            return 1
+            return 1 if label == 1 else -1   # loss = price went bearish
         if alert.direction == "BEARISH":
-            return -1
+            return -1 if label == 1 else 1   # loss = price went bullish
         return 0
 
     def get_label_stats(self) -> dict:
-        """Stats on labeled vs unlabeled records plus quality distribution."""
+        """Stats on labeled vs unlabeled records plus quality and source distribution."""
         from sqlalchemy import func, case
         with self._db.get_session() as session:
             from database.models import MLFeatureRecord
@@ -450,10 +527,20 @@ class AutoLabeler:
                 func.sum(case((MLFeatureRecord.label_quality == 1, 1), else_=0)).label("q_t1"),
                 func.sum(case((MLFeatureRecord.label_quality == 2, 1), else_=0)).label("q_t2"),
                 func.sum(case((MLFeatureRecord.label_quality == 3, 1), else_=0)).label("q_t3"),
+                # Label source breakdown — P1 = real P&L (best), P4 = ATR heuristic (weakest)
+                func.sum(case((MLFeatureRecord.label_source == 1, 1), else_=0)).label("src_p1"),
+                func.sum(case((MLFeatureRecord.label_source == 2, 1), else_=0)).label("src_p2"),
+                func.sum(case((MLFeatureRecord.label_source == 3, 1), else_=0)).label("src_p3"),
+                func.sum(case((MLFeatureRecord.label_source == 4, 1), else_=0)).label("src_p4"),
             ).one()
             total    = row.total    or 0
             labeled  = row.labeled  or 0
             positive = row.positive or 0
+            src_p1   = row.src_p1 or 0
+            src_p2   = row.src_p2 or 0
+            src_p3   = row.src_p3 or 0
+            src_p4   = row.src_p4 or 0
+            high_quality = src_p1 + src_p2 + src_p3
             return {
                 "total":            total,
                 "labeled":          labeled,
@@ -467,4 +554,11 @@ class AutoLabeler:
                 "quality_t1":  row.q_t1 or 0,
                 "quality_t2":  row.q_t2 or 0,
                 "quality_t3":  row.q_t3 or 0,
+                # Label source distribution — critical for ML data quality assessment
+                "source_p1_trade_outcome": src_p1,
+                "source_p2_cross_link":    src_p2,
+                "source_p3_option_chain":  src_p3,
+                "source_p4_atr_heuristic": src_p4,
+                "high_quality_pct": round(high_quality / max(labeled, 1) * 100, 1),
+                "atr_heuristic_pct": round(src_p4 / max(labeled, 1) * 100, 1),
             }

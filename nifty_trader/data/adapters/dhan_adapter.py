@@ -24,9 +24,10 @@ logger = logging.getLogger(__name__)
 
 # Dhan security IDs for indices
 _DHAN_SECURITY_IDS = {
-    "NIFTY":     "13",
-    "BANKNIFTY": "25",
-    "MIDCPNIFTY":"27",
+    "NIFTY":      "13",
+    "BANKNIFTY":  "25",
+    "MIDCPNIFTY": "27",
+    "SENSEX":     "51",   # BSE SENSEX index security ID on Dhan
 }
 
 
