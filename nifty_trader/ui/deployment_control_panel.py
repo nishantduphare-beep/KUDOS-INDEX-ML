@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QToggleButton, QSlider, QFrame, QGridLayout, QProgressBar
+    QFrame, QGridLayout, QProgressBar, QMessageBox
 )
 from PySide6.QtCore import Qt, Signal, Slot, QTimer
 from PySide6.QtGui import QColor, QFont
