@@ -392,10 +392,11 @@ EVENT_BLOCK_AFTER_MINS    = 0     # extra buffer after event block_end
 #   premiums (calls) are inflated so the risk/reward is poor.
 #
 # BULLISH signals (buying calls):
-#   Block above 20 — elevated call premiums erode R:R structurally.
+#   Block above 25 — elevated call premiums erode R:R structurally.
 #   VIX 12-15: cheap (ideal for buying calls)
 #   VIX 15-20: normal (trade with care)
-#   VIX > 20 : block — premium too expensive, calls rarely recover SL
+#   VIX 20-25: elevated but manageable for calls
+#   VIX > 25 : block — premium too expensive, calls rarely recover SL
 #
 # BEARISH signals (buying puts):
 #   Allow up to 28 — VIX spike IS the bearish move; put premiums are
@@ -407,7 +408,7 @@ EVENT_BLOCK_AFTER_MINS    = 0     # extra buffer after event block_end
 # Only TRADE_SIGNAL is blocked — early alerts still fire for ML data.
 # ─────────────────────────────────────────────────────────────────
 SIGNAL_BLOCK_ON_HIGH_VIX      = True   # master switch
-MAX_VIX_FOR_BULLISH_SIGNAL    = 20.0   # calls blocked above this (premium too expensive)
+MAX_VIX_FOR_BULLISH_SIGNAL    = 25.0   # calls blocked above this (premium too expensive)
 MAX_VIX_FOR_BEARISH_SIGNAL    = 28.0   # puts allowed up to this (VIX spike = fear confirmation)
 # ⚠️  DO NOT raise MAX_VIX_FOR_BEARISH_SIGNAL above 30 — above 30 is panic/circuit-breaker
 #    territory where even puts gap-down on halt opens and SL becomes unreliable.
