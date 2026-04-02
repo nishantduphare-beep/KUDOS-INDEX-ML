@@ -712,7 +712,7 @@ class EODOptionsAuditor:
         """Build a Fyers option trading symbol (e.g. NSE:NIFTY25MAR22500CE)."""
         try:
             from trading.order_manager import build_fyers_symbol
-            return build_fyers_symbol(idx, expiry, strike, opt_type)
+            return build_fyers_symbol(idx, strike, opt_type, expiry)  # fixed arg order: (index, strike, type, expiry)
         except Exception as e:
             logger.debug(f"_build_option_symbol: {e}")
             return None
