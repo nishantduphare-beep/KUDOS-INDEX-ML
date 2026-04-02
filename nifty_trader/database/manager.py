@@ -66,6 +66,7 @@ class DatabaseManager:
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA busy_timeout=60000")
             cur.execute("PRAGMA foreign_keys=ON")
+            cur.execute("PRAGMA synchronous=NORMAL")
             cur.close()
         self.SessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=self.engine

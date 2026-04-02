@@ -32,12 +32,32 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 
+def _on_exit():
+    """Flush WAL and close resources on app exit."""
+    try:
+        from database.manager import get_db
+        get_db().close()
+        logger.info("Graceful shutdown: DB WAL flushed")
+    except Exception:
+        pass
+
+import atexit
+atexit.register(_on_exit)
+
+
 def main():
     import config as _cfg
     logger.info("=" * 60)
     logger.info("NiftyTrader Intelligence v2.0 — Starting")
     logger.info(f"Broker: {_cfg.BROKER}")
     logger.info("=" * 60)
+
+    # Validate config settings
+    try:
+        from config_validator import validate_config
+        validate_config()
+    except Exception as _cv_err:
+        logger.warning(f"Config validation error: {_cv_err}")
 
     try:
         from PySide6.QtWidgets import QApplication
@@ -63,6 +83,13 @@ def main():
     except Exception as _ecu_err:
         logger.warning(f"Event calendar updater could not start: {_ecu_err}")
 
+    # Schedule daily DB backup at 15:35 IST (post-market close)
+    try:
+        from database.backup_manager import schedule_daily_backup
+        schedule_daily_backup()
+    except Exception as _bu_err:
+        logger.warning(f"Backup scheduler could not start: {_bu_err}")
+
     data_manager      = DataManager()
     signal_aggregator = SignalAggregator()
     alert_manager     = AlertManager()
@@ -81,13 +108,6 @@ def main():
 
     logger.info("Application ready.")
     exit_code = app.exec()
-
-    # Flush WAL to main DB file on clean shutdown
-    try:
-        from database.manager import get_db
-        get_db().close()
-    except Exception as _e:
-        logger.warning(f"DB close on exit failed: {_e}")
 
     sys.exit(exit_code)
 

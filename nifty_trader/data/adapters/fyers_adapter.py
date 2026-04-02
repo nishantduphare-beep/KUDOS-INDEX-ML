@@ -143,6 +143,34 @@ def load_fyers_token() -> Optional[Dict]:
     return None
 
 
+def _check_token_expiry_on_startup(token_data: dict) -> None:
+    """Log expiry status at startup so user knows to re-authenticate."""
+    try:
+        from datetime import timezone
+        exp_str = token_data.get("expires_at", "")
+        if not exp_str:
+            return
+        exp = datetime.fromisoformat(exp_str)
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        remaining_sec = (exp - now).total_seconds()
+        if remaining_sec < 0:
+            logger.error(
+                f"Fyers token EXPIRED {abs(remaining_sec)/3600:.1f}h ago — "
+                "go to Credentials tab → Fyers → 'Generate Auth URL' to re-authenticate"
+            )
+        elif remaining_sec < 3600:
+            logger.warning(
+                f"Fyers token expires in {remaining_sec/60:.0f} min — "
+                "re-authenticate soon via Credentials tab"
+            )
+        else:
+            logger.info(f"Fyers token valid ({remaining_sec/3600:.1f}h remaining)")
+    except Exception as _te:
+        logger.debug(f"Token expiry check failed: {_te}")
+
+
 def fyers_token_expiry_display() -> str:
     """Human-readable expiry string for UI."""
     data = load_fyers_token()
@@ -277,6 +305,7 @@ class FyersAdapter(CombinedBrokerAdapter):
         # Try cached token first
         cached = load_fyers_token()
         if cached:
+            _check_token_expiry_on_startup(cached)
             return self._init_session(
                 cached.get("app_id", self._creds.get("app_id", "")),
                 cached["access_token"]
@@ -298,6 +327,16 @@ class FyersAdapter(CombinedBrokerAdapter):
 
     def is_connected(self) -> bool:
         return self._connected
+
+    def health_check(self) -> dict:
+        """Return broker connection health status."""
+        import time
+        return {
+            "connected": self._fyers is not None,
+            "token_valid": self._access_token is not None if hasattr(self, "_access_token") else self._fyers is not None,
+            "broker_name": "fyers",
+            "spot_cache_size": len(getattr(self, "_spot_cache", {})),
+        }
 
     # ─── Market Data ─────────────────────────────────────────────
     def get_all_spot_prices(self) -> dict:

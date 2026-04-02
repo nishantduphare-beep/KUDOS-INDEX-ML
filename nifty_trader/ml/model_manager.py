@@ -61,6 +61,8 @@ class ModelVersion:
     is_active:     bool = True
     # Training distribution: {feature_name: [mean, std]} for drift detection (Item 7)
     training_stats: Dict[str, List[float]] = field(default_factory=dict)
+    feature_schema_version: int = 2   # increment whenever FEATURE_COLUMNS changes
+    feature_schema_hash: str = ""     # SHA-256 prefix of sorted FEATURE_COLUMNS for mismatch detection
 
     def to_dict(self) -> Dict:
         return {
@@ -73,6 +75,8 @@ class ModelVersion:
             "feature_importance": self.feature_importance,
             "feature_cols":       self.feature_cols,
             "training_stats":     self.training_stats,     # {feat: [mean, std]} for drift detection
+            "feature_schema_version": self.feature_schema_version,
+            "feature_schema_hash":    self.feature_schema_hash,
         }
 
 
@@ -395,6 +399,9 @@ class ModelManager:
             feature_cols   = feature_cols,
             training_stats = training_stats,   # Item 7: drift detection baseline
         )
+        import hashlib
+        _feat_str = "|".join(sorted(feature_cols))
+        mv.feature_schema_hash = hashlib.sha256(_feat_str.encode()).hexdigest()[:12]
 
         with self._lock:
             self._model         = model
@@ -450,6 +457,15 @@ class ModelManager:
         pos  = int(y_tr.sum())
         neg  = len(y_tr) - pos
         scale_pos = round(neg / max(pos, 1), 2)
+
+        pos_rate = pos / max(len(y_tr), 1)
+        if pos_rate < 0.20:
+            logger.warning(
+                f"Severe class imbalance: {pos} wins vs {neg} losses "
+                f"({pos_rate*100:.1f}% positive rate). "
+                f"scale_pos_weight={scale_pos:.1f} applied to compensate. "
+                "Consider labeling more true positives (P1/P2 sources)."
+            )
 
         base_model = None
         importance = {}
@@ -727,6 +743,8 @@ class ModelManager:
                     feature_importance = meta.get("feature_importance", {}),
                     feature_cols   = meta.get("feature_cols", []),
                     training_stats = meta.get("training_stats", {}),
+                    feature_schema_version = meta.get("feature_schema_version", 1),
+                    feature_schema_hash    = meta.get("feature_schema_hash", ""),
                 )
                 self._last_sample_count = self._model_version.samples_used
                 logger.info(
@@ -734,6 +752,19 @@ class ModelManager:
                     f"({self._model_version.samples_used} samples, "
                     f"{self._model_version.model_type})"
                 )
+                # Validate schema hash against current FEATURE_COLUMNS
+                if self._model_version.feature_schema_hash:
+                    import hashlib
+                    _current_hash = hashlib.sha256(
+                        "|".join(sorted(FEATURE_COLUMNS)).encode()
+                    ).hexdigest()[:12]
+                    if _current_hash != self._model_version.feature_schema_hash:
+                        logger.warning(
+                            f"Feature schema hash mismatch: model has "
+                            f"{self._model_version.feature_schema_hash!r}, "
+                            f"current FEATURE_COLUMNS hash={_current_hash!r}. "
+                            f"Model was trained with a different feature set — retrain recommended."
+                        )
                 # Validate that saved feature columns match current FEATURE_COLUMNS.
                 # A mismatch means the model was trained with a different engine set
                 # and predictions will be silently wrong.
