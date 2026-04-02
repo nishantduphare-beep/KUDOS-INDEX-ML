@@ -399,9 +399,9 @@ class DatabaseManager:
             # Fast open-trade queries
             "CREATE INDEX IF NOT EXISTS idx_outcomes_open "
             "ON trade_outcomes(status) WHERE status='OPEN'",
-            # Fast alert timestamp + signal_type queries
+            # Fast alert timestamp + alert_type queries (column is alert_type, not signal_type)
             "CREATE INDEX IF NOT EXISTS idx_alerts_ts_sig "
-            "ON alerts(timestamp DESC, signal_type)",
+            "ON alerts(timestamp DESC, alert_type)",
         ]
         try:
             with self.engine.connect() as conn:
