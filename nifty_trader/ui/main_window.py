@@ -25,9 +25,10 @@ from ui.hq_trades_tab    import HQTradesTab
 from ui.credentials_tab  import CredentialsTab
 from ui.ml_report_widget import MLReportWidget
 from ui.ledger_tab       import LedgerTab
-from ui.setup_tab        import SetupTab
-from ui.s11_tab          import S11Tab
-from ui.ml_testing_tab   import MLTestingTab
+from ui.setup_tab              import SetupTab
+from ui.s11_tab                import S11Tab
+from ui.ml_testing_tab         import MLTestingTab
+from ui.deployment_control_panel import DeploymentControlPanel
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,7 @@ class MainWindow(QMainWindow):
         self._ledger_tab    = LedgerTab()
         self._s11_tab       = S11Tab()
         self._ml_test_tab   = MLTestingTab()
+        self._deploy_tab    = DeploymentControlPanel()
 
         self._tabs.addTab(self._cred_tab,      "🔑  CREDENTIALS")
         self._tabs.addTab(self._dashboard_tab, "📊  DASHBOARD")
@@ -207,6 +209,7 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._ledger_tab,    "📒  LEDGER")
         self._tabs.addTab(self._s11_tab,       "⚡  S11")
         self._tabs.addTab(self._ml_test_tab,   "🧠  ML TESTER")
+        self._tabs.addTab(self._deploy_tab,    "🚀  DEPLOY")
 
         # Developer-only tab — hidden in client builds
         self._ml_report_tab = None
