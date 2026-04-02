@@ -510,6 +510,29 @@ UI_REFRESH_INTERVAL_MS        = 1000
 ALERT_FLASH_DURATION_MS       = 3000
 
 # ─────────────────────────────────────────────────────────────────
+# LIVE TRADING CONFIGURATION
+# CRITICAL: These settings control REAL MONEY trading behavior
+# ─────────────────────────────────────────────────────────────────
+LIVE_TRADING_MODE             = False  # ⚠️ REAL MONEY - User sets to True ONLY after all checks pass
+PAPER_TRADING_MODE            = True   # True = paper mode only (no real orders)
+POSITION_SIZE_CONTRACTS       = 1      # Start with 1 lot ONLY
+MAX_CONCURRENT_TRADES         = 2      # Never more than 2 open simultaneously
+MAX_DAILY_LOSS_RUPEES         = 5000   # Stop all trading if daily loss exceeds this
+AUTO_STOP_LOSS_ENABLED        = True   # MUST be True for live trading
+EMERGENCY_EXIT_THRESHOLD      = 2.5    # Stop if ATR move exceeds this multiple (circuit breaker)
+
+# Risk management & confidence thresholds
+REQUIRED_MODEL_CONFIDENCE     = 0.55   # Only trade if ML score exceeds this
+MINIMUM_LIVE_TESTING_DAYS     = 5      # Paper trade for at least this many days first
+LIVE_TRADING_START_TIME       = "09:30"  # IST - don't trade before market open
+LIVE_TRADING_STOP_TIME        = "14:45"  # IST - close all trades before EOD
+LIVE_TRADING_STOP_LOSS_TIME   = "15:20"  # IST - final emergency close time
+
+# Monitoring & alerts
+LIVE_TRADING_ALERT_EMAIL      = os.getenv("LIVE_TRADING_ALERT_EMAIL", "")  # Optional email alerting
+MONITOR_DASHBOARD_PORT        = 8000  # Real-time dashboard URL: http://localhost:8000
+
+# ─────────────────────────────────────────────────────────────────
 # MOCK DATA
 # ─────────────────────────────────────────────────────────────────
 MOCK_BASE_PRICES = {

@@ -1059,6 +1059,53 @@ class DatabaseManager:
             session.expunge_all()
             return rows
 
+    def get_open_trade_outcomes(self) -> List[Dict[str, Any]]:
+        """
+        Get all OPEN trade outcomes as dictionaries.
+        
+        Used by auto_stop_loss.py and live_trading_dashboard.py
+        to monitor open positions and trigger stop-losses.
+        
+        Returns:
+            List of dictionaries with trade data
+        """
+        try:
+            open_outcomes = self.get_open_outcomes()
+            return [
+                {
+                    "id": o.id,
+                    "alert_id": o.alert_id,
+                    "index_name": o.index_name,
+                    "instrument": o.instrument,
+                    "direction": o.direction,
+                    "entry_time": o.entry_time,
+                    "entry_spot": o.entry_spot,
+                    "entry_price": o.entry_price,
+                    "exit_price": o.exit_price,
+                    "spot_sl": o.spot_sl,
+                    "spot_t1": o.spot_t1,
+                    "spot_t2": o.spot_t2,
+                    "spot_t3": o.spot_t3,
+                    "sl_hit": o.sl_hit,
+                    "t1_hit": o.t1_hit,
+                    "t2_hit": o.t2_hit,
+                    "t3_hit": o.t3_hit,
+                    "stop_loss": o.spot_sl,  # Alias for compatibility
+                    "symbol": o.instrument,  # Alias for compatibility
+                    "quantity": o.lot_size,
+                    "status": o.status,
+                    "realized_pnl": o.realized_pnl,
+                    "exit_reason": o.exit_reason,
+                    "atr_at_signal": o.atr_at_signal,
+                    "mfe_atr": o.mfe_atr,
+                    "mae_atr": o.mae_atr,
+                }
+                for o in open_outcomes
+            ]
+        except Exception as e:
+            logger.error(f"Error getting open trade outcomes: {e}")
+            return []
+
     def get_trade_outcome_by_alert(self, alert_id: int):
         """Return the most recent TradeOutcome for the given alert_id, or None."""
         with self.get_session() as session:
