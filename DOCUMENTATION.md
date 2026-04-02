@@ -1,6 +1,6 @@
 # NiftyTrader Intelligence System — Complete Guide
 
-> Version 3.2 | Updated: April 2026
+> Version 3.3 | Updated: April 2026
 > Intraday Options Signal & ML Intelligence Platform for Indian Equity Indices
 > Status: **Production Ready**
 
@@ -293,7 +293,8 @@ Then additional quality gates for TRADE SIGNAL:
   ✓ PCR ≥ 0.7
   ✓ ML probability ≥ 0.45 (if model is trained)
   ✓ No active event window (RBI/Fed/Budget)
-  ✓ VIX within acceptable range (if gate enabled)
+  ✓ VIX ≤ 20 for BULLISH (calls blocked above 20 — premium too expensive)
+  ✓ VIX ≤ 28 for BEARISH (puts allowed up to 28 — VIX spike confirms fear)
   ✓ Not in cooldown from prior signal (1 candle per direction)
   → TRADE SIGNAL fires
 ```
@@ -759,9 +760,19 @@ The expiry calendar works in two layers:
 
 ## 19. Production Fixes Applied
 
+### v3.2 → v3.3 (April 2026)
+
+3 fixes applied:
+
+| ID | Severity | File | Fix |
+|----|----------|------|-----|
+| W-1 | High | fyers_adapter.py + data_manager.py | **429 silently swallowed** — `get_all_spot_prices()` and `get_all_futures_quotes()` returned `{}` on 429 instead of raising. `data_manager` called `success()` on the circuit breaker after every empty return, so the breaker never opened. Fix: detect `resp["code"]==429` and raise `ConnectionError`; circuit breaker now correctly opens after 5 hits and pauses calls 60s. Also moved `_market_active` window start from 9:00 → 9:15 AM (confirmed Fyers returns 429 for the full 9:00–9:15 pre-open window). |
+| W-2 | Medium | database/manager.py | **DB index bad column** — `idx_alerts_ts_sig` referenced non-existent column `signal_type`. Corrected to `alert_type` (the actual alerts table column). Caused startup warning on every run. |
+| W-3 | High | engines/signal_aggregator.py + config.py | **VIX gate direction-blind** — Single flat threshold (20.0) blocked all signals including high-confidence BEARISH signals during VIX spikes. VIX spikes WITH market falls, so bearish signals in high VIX are self-consistent. Replaced with direction-aware gate: BULLISH blocked above 20 (expensive calls), BEARISH allowed up to 28 (put premiums covered by market move). |
+
 ### v3.1 → v3.2 (April 2026)
 
-10 fixes applied in this session:
+12 fixes applied:
 
 | ID | Severity | File | Fix |
 |----|----------|------|-----|

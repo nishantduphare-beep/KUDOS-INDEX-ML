@@ -323,7 +323,8 @@ TRADE_SIGNAL_MIN_DI_SPREAD    = 5.0    # |+DI − -DI| ≥ 5 in signal direction
 TRADE_SIGNAL_REQUIRE_MTF_STRONG = True # both 5m+15m must agree (STRONG); PARTIAL/NEUTRAL blocked
 ML_SIGNAL_GATE_THRESHOLD      = 0.50   # ML probability gate (Phase 2+); session-specific overrides apply
 REQUIRE_TRENDING_REGIME       = True   # TRENDING regime required — single most powerful filter (55.8% WR)
-MAX_VIX_FOR_SIGNAL            = 20.0   # VIX > 20 = expensive options + whippy market → block Trade Signal
+MAX_VIX_FOR_BULLISH_SIGNAL    = 20.0   # BULLISH blocked above 20 — call premiums too expensive
+MAX_VIX_FOR_BEARISH_SIGNAL    = 28.0   # BEARISH allowed up to 28 — VIX spike confirms bearish move
 AUTO_TRADE_ENABLED            = False  # OFF by default — enable via dashboard toggle
 SOUND_ALERTS_ENABLED          = True
 POPUP_ALERTS_ENABLED          = True
@@ -347,6 +348,14 @@ TELEGRAM_ENABLED              = False  # set via env var TELEGRAM_ENABLED=true
 - Pre-market (before 9:00 IST): all live API calls blocked — spot falls back to `prev_day_close`
 
 ---
+
+## Production Fixes Applied (v3.3 — April 2026)
+
+| # | Severity | File | Fix |
+|---|----------|------|-----|
+| W-1 | High | fyers_adapter.py + data_manager.py | 429 silently swallowed — adapter returned `{}` instead of raising; circuit breaker never opened. Fix: raise `ConnectionError` on 429. Also moved `_market_active` to 9:15 AM (Fyers 429s entire 9:00–9:15 pre-open). |
+| W-2 | Medium | database/manager.py | DB index `idx_alerts_ts_sig` referenced non-existent column `signal_type`. Corrected to `alert_type`. |
+| W-3 | High | signal_aggregator.py + config.py | VIX gate direction-blind — replaced single 20.0 threshold with direction-aware gate: BULLISH blocked >20, BEARISH allowed up to 28. VIX spikes confirm bearish moves. |
 
 ## Production Fixes Applied (v3.2 — April 2026)
 

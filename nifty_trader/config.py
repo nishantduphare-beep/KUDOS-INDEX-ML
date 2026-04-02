@@ -383,18 +383,34 @@ EVENT_BLOCK_AFTER_MINS    = 0     # extra buffer after event block_end
                                   # (windows already include generous coverage)
 
 # ─────────────────────────────────────────────────────────────────
-# VIX GATE
-# India VIX > threshold = options are expensive + market is whippy.
-# Buying options in high-VIX environments has structurally negative
-# expectancy: you pay elevated premium for moves that don't exceed SL.
+# VIX GATE — DIRECTION-AWARE
+#
+# WHY direction matters:
+#   VIX spikes when the market falls — a BEARISH signal coinciding with
+#   high VIX is self-consistent (fear confirms the move direction).
+#   A BULLISH signal in high VIX fights the prevailing fear; option
+#   premiums (calls) are inflated so the risk/reward is poor.
+#
+# BULLISH signals (buying calls):
+#   Block above 20 — elevated call premiums erode R:R structurally.
+#   VIX 12-15: cheap (ideal for buying calls)
+#   VIX 15-20: normal (trade with care)
+#   VIX > 20 : block — premium too expensive, calls rarely recover SL
+#
+# BEARISH signals (buying puts):
+#   Allow up to 28 — VIX spike IS the bearish move; put premiums are
+#   elevated but the market move typically exceeds them on the downside.
+#   VIX 20-25: elevated but manageable for puts
+#   VIX 25-28: fear-spike zone — puts outperform on sharp falls
+#   VIX > 28 : extreme panic; whipsaw risk > directional reward → block
+#
 # Only TRADE_SIGNAL is blocked — early alerts still fire for ML data.
 # ─────────────────────────────────────────────────────────────────
-SIGNAL_BLOCK_ON_HIGH_VIX  = True   # master switch
-MAX_VIX_FOR_SIGNAL        = 20.0   # VIX ≤ 20 = acceptable premium; > 20 = block
-                                   # VIX 12-15: cheap (best time to buy)
-                                   # VIX 15-20: normal (trade with care)
-                                   # VIX 20-25: expensive (block by default)
-                                   # VIX > 25 : very expensive (always blocked)
+SIGNAL_BLOCK_ON_HIGH_VIX      = True   # master switch
+MAX_VIX_FOR_BULLISH_SIGNAL    = 20.0   # calls blocked above this (premium too expensive)
+MAX_VIX_FOR_BEARISH_SIGNAL    = 28.0   # puts allowed up to this (VIX spike = fear confirmation)
+# ⚠️  DO NOT raise MAX_VIX_FOR_BEARISH_SIGNAL above 30 — above 30 is panic/circuit-breaker
+#    territory where even puts gap-down on halt opens and SL becomes unreliable.
 
 # ─────────────────────────────────────────────────────────────────
 # MARKET HOURS (IST)

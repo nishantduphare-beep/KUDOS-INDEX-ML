@@ -188,7 +188,7 @@ class SignalAggregator:
          • ADX ≥ TRADE_SIGNAL_MIN_ADX, |DI spread| ≥ TRADE_SIGNAL_MIN_DI_SPREAD
          • MTF alignment = STRONG (both 5m + 15m agree)
          • regime = TRENDING (if REQUIRE_TRENDING_REGIME)
-         • VIX ≤ MAX_VIX_FOR_SIGNAL (if SIGNAL_BLOCK_ON_HIGH_VIX)
+         • VIX ≤ MAX_VIX_FOR_BULLISH_SIGNAL (BULLISH) or MAX_VIX_FOR_BEARISH_SIGNAL (BEARISH)
          • no active calendar event block
     5. Save ML feature row to DB (every evaluation, labeled later by AutoLabeler)
     6. Run SetupScreener — 23 named setups, saved to setup_alerts table
@@ -833,19 +833,32 @@ class SignalAggregator:
                                 f"event='{_event_name}'")
                     self._last_mtf_block_log[f"{index_name}:event"] = now
 
-            # ── VIX gate ──────────────────────────────────────────
-            # India VIX > threshold = options are expensive + market whippy.
-            # Buying options in high-VIX environments: you pay elevated premium
-            # for moves that often don't exceed the SL before reversing.
+            # ── VIX gate (direction-aware) ─────────────────────────
+            # WHY direction-aware (not a single flat threshold):
+            #   VIX spikes WITH market falls — a BEARISH signal in high VIX
+            #   is self-consistent (fear confirms the move). BULLISH signals
+            #   in high VIX fight prevailing fear AND pay elevated call premiums.
+            #
+            # BULLISH → MAX_VIX_FOR_BULLISH_SIGNAL (20): calls too expensive above 20
+            # BEARISH → MAX_VIX_FOR_BEARISH_SIGNAL (28): puts outperform on fear spikes
+            #
+            # See config.py VIX GATE section for full rationale.
             _vix_ok = True
             if config.SIGNAL_BLOCK_ON_HIGH_VIX and self._vix > 0:
-                _vix_ok = self._vix <= config.MAX_VIX_FOR_SIGNAL
+                _vix_threshold = (
+                    config.MAX_VIX_FOR_BEARISH_SIGNAL if consensus_direction == "BEARISH"
+                    else config.MAX_VIX_FOR_BULLISH_SIGNAL
+                )
+                _vix_ok = self._vix <= _vix_threshold
                 if not _vix_ok:
                     _last_log = self._last_mtf_block_log.get(f"{index_name}:vix")
                     _log_cooldown = config.CANDLE_INTERVAL_MINUTES * 60
                     if not _last_log or (now - _last_log).total_seconds() >= _log_cooldown:
-                        logger.info(f"Trade Signal blocked: HIGH VIX [{index_name}] "
-                                    f"vix={self._vix:.1f} > {config.MAX_VIX_FOR_SIGNAL}")
+                        logger.info(
+                            f"Trade Signal blocked: HIGH VIX [{index_name}] "
+                            f"vix={self._vix:.1f} > {_vix_threshold:.0f} "
+                            f"({consensus_direction} threshold)"
+                        )
                         self._last_mtf_block_log[f"{index_name}:vix"] = now
 
             # ADX gate — trend must be strong enough on the 3m candle.
@@ -893,7 +906,7 @@ class SignalAggregator:
                         f"pcr={pcr:.2f}(ok={_pcr_ok}) "
                         f"index_blocked={_index_blocked} strict_ok={_strict_conf_ok} "
                         f"ml_prob={_ml_prob}(thr={_ml_threshold:.2f},ok={_ml_gate_ok}) "
-                        f"event_ok={_event_ok} vix={self._vix:.1f}(ok={_vix_ok}) "
+                        f"event_ok={_event_ok} vix={self._vix:.1f}(thr={_vix_threshold:.0f},ok={_vix_ok}) "
                         f"regime={_regime_label}(trending_ok={_trending_ok}) "
                         f"dir_filter={_allowed_dir or 'any'}(ok={_direction_ok}) "
                         f"engines={engines_triggered}"
