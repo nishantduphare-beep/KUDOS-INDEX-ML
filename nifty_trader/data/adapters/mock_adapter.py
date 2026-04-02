@@ -140,6 +140,26 @@ class MockAdapter(CombinedBrokerAdapter):
             ))
         return futures
 
+    def get_all_futures_quotes(self) -> Dict[str, Dict]:
+        """
+        Mock: Return real-time futures OI + LTP for all indices.
+        Used to update OI in real-time during the trading day.
+        Fyers adapter has the same signature.
+        """
+        result: Dict[str, Dict] = {}
+        for idx in config.INDICES:
+            # Simulate evolving OI throughout the day
+            base_oi = self.MOCK_BASE_OI.get(idx, 5_000_000.0)
+            # OI drifts slightly each call (realistic intraday evolution)
+            live_oi = base_oi * random.uniform(0.95, 1.05)
+            live_ltp = self._prices.get(idx, base_oi)  # use current simulated spot
+            
+            result[idx] = {
+                "oi": round(live_oi, 0),
+                "lp": round(live_ltp, 2),
+            }
+        return result
+
     # ─── Internal helpers ─────────────────────────────────────────
 
     def _evolve_price(self, index_name: str):

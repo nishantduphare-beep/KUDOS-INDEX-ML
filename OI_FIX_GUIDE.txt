@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""
+Quick fix for OI Change Not Updating
+Diagnostics and workarounds for the OI change display issue
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+print("\n" + "="*70)
+print("OI CHANGE NOT UPDATING - ROOT CAUSE ANALYSIS")
+print("="*70)
+
+print("""
+PROBLEM IDENTIFIED:
+- OI values are being fetched from Fyers API but may not be populating correctly
+- OI change calculation in dashboard depends on historical OI values in futures_df
+- If OI is always 0, the change percentage will always be 0%
+
+ROOT CAUSES (in order of likelihood):
+
+1. ℹ️ FYERS API NOT RETURNING OI FOR FUTURES QUOTES
+   Location: nifty_trader/data/adapters/fyers_adapter.py line 556
+   Issue: v.get("oi", 0) might return 0 if Fyers uses different field name
+   Fix: Check Fyers API documentation for correct field name
+        Try logging the full 'v' dictionary to see what fields are available
+
+2. ⚠️ OI VALUES NOT BEING PERSISTED BETWEEN CANDLES
+   Location: nifty_trader/data/data_manager.py line 928-930
+   Issue: When new candles arrive, old OI values might be cleared
+   Fix: Ensure restore_oi_history() is loading previous OI values
+        Check if database is saving OI for each candle
+
+3. ⏳ MARKET CLOSED / NO DATA
+   Issue: During non-trading hours, OI data may not update
+   Status: This is EXPECTED BEHAVIOR (shows "--" on dashboard)
+   Fix: Wait until market hours (9:15-15:30 IST) to see OI changes
+
+4. 🔧 FUTURES QUOTES API DISABLED
+   Location: nifty_trader/data/data_manager.py line 616
+   Issue: hasattr(self._adapter, "get_all_futures_quotes") might fail
+   Status: Should work for Fyers adapter (it has this method)
+   Fix: Check logs for "Futures quotes tick error"
+""")
+
+print("\n" + "="*70)
+print("IMMEDIATE FIXES TO TRY")
+print("="*70)
+
+print("""
+Fix 1: Enable Debug Logging
+─────────────────────────
+1. Edit nifty_trader/config.py
+2. Set LOG_LEVEL = "DEBUG"
+3. Check logs/niftytrader_YYYYMMDD.log for OI fetch details
+4. Look for line: "Futures OI [NIFTY]"
+
+Fix 2: Verify Fyers API is Being Called
+──────────────────────────────────────
+1. The app should log:
+   - "Futures quotes request: NSE:NIFTY26MARFUT,..."
+   - "Futures OI [NIFTY] sym=... oi=... lp=..."
+
+2. If these logs don't appear:
+   - Check if Fyers is connected (should see green "LIVE - FYERS")
+   - Click "Connect" if needed
+   - Check if market is active (9:15-15:30 IST)
+
+Fix 3: Check Database OI Storage
+────────────────────────────────
+1. Open SQLite database:
+   sqlite3 nifty_trader/nifty_trader.db
+
+2. Query futures OI:
+   SELECT COUNT(*) as oi_count FROM market_candles 
+   WHERE is_futures=true AND oi > 0;
+
+3. If count is 0:
+   - OI values are not being saved to database
+   - This means futures_quotes API is either:
+     a) Not returning OI values
+     b) Values are 0
+     c) Database update is failing
+
+Fix 4: Force Update Test
+────────────────────────
+Add this test to nifty_trader/data/adapters/fyers_adapter.py
+after get_all_futures_quotes() method:
+
+    def test_futures_oi(self):
+        quotes = self.get_all_futures_quotes()
+        import json
+        print(f"DEBUG: Full futures quotes response:")
+        print(json.dumps(quotes, indent=2))
+
+Then call:
+    adapter = FyersAdapter()
+    adapter.test_futures_oi()
+""")
+
+print("\n" + "="*70)
+print("TECHNICAL DETAILS")
+print("="*70)
+
+print("""
+How OI Change Display Works:
+1. Dashboard calls _classify_oi(futures_df, timeframe_minutes)
+2. This function:
+   - Gets current OI from futures_df.iloc[-1]['oi']
+   - Finds reference row from N minutes ago
+   - Calculates: (current_oi - reference_oi) / reference_oi * 100
+   - Returns percentage change
+   - Displays as "LONG BUILDUP", "SHORT COVERING", etc.
+
+Why It Might Show "--":
+- futures_df['oi'] column is all zeros initially
+- update_futures_oi_tick() updates ONLY the latest row
+- When new candles arrive, they're added with oi=0
+- Need at least 2 data points for comparison
+- If all OI values are 0, change is 0% → displays as "--"
+
+Expected Data Flow:
+Fyers API → get_all_futures_quotes() → {oi: float}
+           ↓
+         update_futures_oi_tick() in DataManager tick loop
+           ↓
+         futures_df.iloc[-1]['oi'] = live_oi
+           ↓
+         _persist_futures_candles() saves to DB
+           ↓
+         restore_oi_history() loads on next startup
+""")
+
+print("\n" + "="*70)
+print("RECOMMENDED DEBUGGING STEP")
+print("="*70)
+
+code_to_add = '''
+# Add this to nifty_trader/data/adapters/fyers_adapter.py around line 550
+
+def get_all_futures_quotes(self) -> Dict[str, Dict]:
+    """..."""
+    # ... existing code up to the for loop...
+    
+    for item in d:
+        sym = item.get("n", "")
+        v   = item.get("v", {})
+        idx = rev.get(sym) or rev_bare.get(sym.split(":", 1)[-1])
+        if idx:
+            oi_val = float(v.get("oi", 0) or 0)
+            lp_val = float(v.get("lp", 0) or 0)
+            
+            # DEBUG: Log all available fields
+            import logging
+            logger = logging.getLogger(__name__)
+            if oi_val == 0:  # Only log when OI is 0 (likely issue)
+                logger.warning(f"Futures quote OI is 0. Available fields in 'v': {v.keys()}")
+                logger.warning(f"Full 'v' dict: {v}")
+            
+            result[idx] = {"oi": oi_val, "lp": lp_val}
+            logger.debug(f"Futures OI [{idx}] sym={sym} oi={oi_val} lp={lp_val}")
+        else:
+            logger.warning(f"Futures quotes: unrecognised symbol '{sym}'")
+    return result
+'''
+
+print("Add this debug code to see what fields Fyers is actually returning:")
+print(code_to_add)
+
+print("\n" + "="*70)
+print("IF YOU FIND THE ISSUE")
+print("="*70)
+print("""
+Once you identify the problem:
+
+1. If Fyers field name is different than "oi":
+   - Update line 556 in fyers_adapter.py
+   - Change: oi_val = float(v.get("oi", 0) or 0)
+   - To: oi_val = float(v.get("actual_field_name", 0) or 0)
+
+2. If Fyers doesn't return OI for futures:
+   - Use options data: call_oi + put_oi from option_chain
+   - Fallback to mock data for testing
+
+3. If issue is database:
+   - Check update_futures_candle_oi() in database/manager.py
+   - Verify the UPDATE query is executing correctly
+""")
+
+print("\n" + "="*70)
+print("END OF DIAGNOSTICS")
+print("="*70)
