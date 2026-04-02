@@ -90,6 +90,13 @@ def main():
     except Exception as _bu_err:
         logger.warning(f"Backup scheduler could not start: {_bu_err}")
 
+    # Schedule daily options data export at 15:36 IST (right after backup)
+    try:
+        from ml.options_feature_engine import schedule_daily_options_export
+        schedule_daily_options_export()
+    except Exception as _oe_err:
+        logger.warning(f"Options export scheduler could not start: {_oe_err}")
+
     data_manager      = DataManager()
     signal_aggregator = SignalAggregator()
     alert_manager     = AlertManager()

@@ -120,6 +120,36 @@ FEATURE_COLUMNS = [
     # Group I: Historical performance context
     "setup_win_rate",          # rolling 20-trade win rate for best-matched setup (0-100)
     "mins_since_last_signal",  # minutes since last TRADE_SIGNAL on same index
+
+    # ─────────────────────────────────────────────────────────────
+    # Group J: OPTIONS CHAIN FEATURES (from options_feature_engine.py)
+    # ─────────────────────────────────────────────────────────────
+    # Volatility Context
+    "atm_iv",                 # ATM IV (%)
+    "iv_percentile",          # IV vs 20-day range (0-100)
+    "call_iv_skew",           # Call IV - Put IV (skew direction)
+    "iv_smile",               # Max(ITM, OTM) IV - ATM IV (smile effect)
+    
+    # OI Context
+    "call_oi",                # Total call OI
+    "put_oi",                 # Total put OI
+    "pcr",                    # Put-Call Ratio (PUT OI / CALL OI)
+    "pcr_volume",             # PCR by volume
+    "oi_imbalance",           # (CALL OI - PUT OI) / (CALL OI + PUT OI), negative=bullish
+    
+    # Greeks Aggregate (OI-weighted)
+    "delta_aggregate",        # OI-weighted delta (call - put)
+    "gamma_aggregate",        # Total gamma (OI-weighted)
+    "theta_aggregate",        # Total theta per day (OI-weighted)
+    "max_gamma_strike",       # Strike with max gamma
+    
+    # Price Context
+    "max_pain",               # Market maker max pain level
+    "price_to_max_pain",      # (Spot - Max Pain) / ATR %
+    "atm_volume",             # Average volume in ATM strikes
+    
+    # Setup Strength
+    "options_setup_strength", # Composite (OI imbalance + IV expansion + gamma)
 ]
 
 TARGET_COLUMN = "label"           # 1 = valid move, 0 = false signal
