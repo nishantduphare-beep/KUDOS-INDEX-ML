@@ -322,6 +322,10 @@ class FyersAdapter(CombinedBrokerAdapter):
             resp = self._fyers.quotes({"symbols": symbols})
             if resp is None:
                 return dict(self._spot_cache)
+            # 429 = Fyers rate limit. Raise so data_manager circuit breaker counts
+            # this as a failure (silent return would call success() and reset the breaker).
+            if resp.get("code") == 429:
+                raise ConnectionError(f"Fyers rate limited (429): {resp}")
             d = resp.get("d", [])
             if not d:
                 logger.warning(f"Fyers batch quotes empty: {resp}")
@@ -487,7 +491,12 @@ class FyersAdapter(CombinedBrokerAdapter):
             symbols_str = ",".join(symbols_map.values())
             logger.debug(f"Futures quotes request: {symbols_str}")
             resp = self._fyers.quotes({"symbols": symbols_str})
-            if not resp or resp.get("s") != "ok":
+            if not resp:
+                return {}
+            # 429 = rate limit — raise so circuit breaker in data_manager counts it
+            if resp.get("code") == 429:
+                raise ConnectionError(f"Fyers rate limited (429): {resp}")
+            if resp.get("s") != "ok":
                 logger.warning(f"Futures quotes API error: {resp}")
                 return {}
             d = resp.get("d", [])

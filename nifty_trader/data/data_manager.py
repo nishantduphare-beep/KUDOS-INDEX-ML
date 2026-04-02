@@ -564,29 +564,29 @@ class DataManager:
         )
         while self._running:
             try:
-                # ── _market_active window: WHY 9:00 AM, not 9:15 AM ────────────
-                # NSE pre-open session runs 9:00–9:15 AM. During pre-open, Fyers
-                # DOES return valid quotes — futures have real buy/sell activity and
-                # we capture the preopen_gap_pct feature (futures LTP vs prev_close).
-                # Starting at 9:00 (not 9:15) lets us collect this pre-open data.
+                # ── _market_active window ────────────────────────────────────
+                # Start: 9:15 AM (NOT 9:00 AM).
+                #   Rationale: live testing showed Fyers returns HTTP 429 for
+                #   the entire 9:00–9:15 pre-open window (the API tier used here
+                #   does not serve live pre-open quotes). Polling from 9:00 floods
+                #   the log and risks temporary app_id suspension by Fyers.
+                #   The preopen_gap_pct ML feature is captured via prev_close at
+                #   bootstrap instead.
                 #
-                # WHY 15:35, not 15:30:
-                # NSE closing session runs 15:30–15:35 (price discovery auction).
-                # Extending to 15:35 ensures we capture the closing tick and final
-                # option chain snapshot before the post-market rate-limit kicks in.
+                # End: 15:35 (not 15:30).
+                #   NSE closing session runs 15:30–15:35 (price discovery auction).
+                #   Extending to 15:35 captures the final closing tick and option
+                #   chain snapshot before post-market rate-limits kick in.
                 #
-                # Outside 9:00–15:35: Fyers aggressively returns HTTP 429 for
-                # quotes() calls. The tick loop still runs every 5s (to stay alive
-                # and respond to reconnect requests), but API calls are skipped.
-                # Spot prices fall back to prev_day_close (set at bootstrap).
+                # Outside 9:15–15:35: tick loop still runs every 5s (keepalive /
+                # reconnect), but all broker API calls are skipped.
                 #
-                # ⚠️  DO NOT widen this window (e.g. to 8:00 AM) — 429s flood the
-                #     log and Fyers may temporarily suspend the app_id.
+                # ⚠️  DO NOT widen to 9:00 AM — confirmed 429 flood in production.
                 # ────────────────────────────────────────────────────────────────
                 import config as _cfg_chk
                 _chk_time = datetime.now(_cfg_chk.IST).time()
                 from datetime import time as _tck
-                _market_active = _tck(9, 0) <= _chk_time <= _tck(15, 35)
+                _market_active = _tck(9, 15) <= _chk_time <= _tck(15, 35)
 
                 # ONE batch spot fetch for all indices to avoid rate limiting
                 # Circuit breaker skips the call when the broker is repeatedly failing.
