@@ -18,6 +18,7 @@ import math
 import config
 from data.base_api import CombinedBrokerAdapter
 from data.structures import Candle, OptionChain, OptionStrike
+from data.bs_utils import bs_greeks as _bs_greeks  # Calculate options greeks
 
 
 class MockAdapter(CombinedBrokerAdapter):
@@ -99,14 +100,28 @@ class MockAdapter(CombinedBrokerAdapter):
             call_ltp = max(0.5, (spot - strike) + iv * spot * 0.01 / 10) if i <= 0 else max(0.5, iv * spot * 0.01 / (dist + 1))
             put_ltp  = max(0.5, (strike - spot) + iv * spot * 0.01 / 10) if i >= 0 else max(0.5, iv * spot * 0.01 / (dist + 1))
 
+            # Calculate Greeks using Black-Scholes model
+            _rate = 0.065  # India repo rate
+            tte = 1.0 / 52.0  # 1 week to expiry
+            cg = _bs_greeks(spot, strike, tte, _rate, "CE", iv)  # iv is already percentage (14.0 = 14%)
+            pg = _bs_greeks(spot, strike, tte, _rate, "PE", iv)  # iv is already percentage (14.0 = 14%)
+
             strikes.append(OptionStrike(
                 strike=strike, expiry=exp,
                 call_oi=call_oi, call_oi_change=call_change,
                 call_volume=random.randint(500, 60_000),
                 call_iv=round(iv, 2), call_ltp=round(call_ltp, 2),
+                call_delta=cg["delta"],
+                call_gamma=cg["gamma"],
+                call_theta=cg["theta"],
+                call_vega=cg["vega"],
                 put_oi=put_oi, put_oi_change=put_change,
                 put_volume=random.randint(500, 60_000),
                 put_iv=round(iv, 2), put_ltp=round(put_ltp, 2),
+                put_delta=pg["delta"],
+                put_gamma=pg["gamma"],
+                put_theta=pg["theta"],
+                put_vega=pg["vega"],
             ))
 
         return OptionChain(index_name, spot, exp, strikes)

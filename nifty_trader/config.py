@@ -447,10 +447,16 @@ FUTURES_SYMBOL_PREFIX = {
 }
 
 # ─────────────────────────────────────────────────────────────────
-# DATABASE
+# DATABASE & DIRECTORIES
 # ─────────────────────────────────────────────────────────────────
 DB_PATH  = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "nifty_trader.db"))
 DB_ECHO  = False
+LOG_DIR  = os.getenv("LOG_DIR", os.path.join(os.path.dirname(__file__), "..", "logs"))
+MODEL_DIR = os.getenv("MODEL_DIR", os.path.join(os.path.dirname(__file__), "..", "models"))
+
+# Ensure directories exist
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ─────────────────────────────────────────────────────────────────
 # ML SETTINGS

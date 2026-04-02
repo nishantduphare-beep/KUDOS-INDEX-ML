@@ -885,6 +885,81 @@ class OrderManager:
                 "fixed_lots":    self._fixed_lots,
             }
 
+    def get_order_status(self, order_id: str) -> Optional[dict]:
+        """
+        Get the current status of a specific order by order_id.
+        
+        Args:
+            order_id: The order ID to query
+            
+        Returns:
+            dict with order details or None if order not found
+        """
+        with self._lock:
+            order = self._open_orders.get(order_id)
+            if order:
+                return dict(order)  # Return copy to avoid external modification
+            
+            # Check today's closed orders
+            for order_rec in self._today_orders:
+                if order_rec.get("order_id") == order_id:
+                    return dict(order_rec)
+            
+            return None
+
+    def validate_order(self, signal, expiry: str = "") -> tuple[bool, str]:
+        """
+        Validate order parameters before placement.
+        
+        Args:
+            signal: TradeSignal object
+            expiry: Expiry date string (e.g. "30-03-2025")
+            
+        Returns:
+            (is_valid: bool, error_message: str)
+        """
+        # Check if trading is enabled
+        if self._mode == "OFF":
+            return False, "Trading mode is OFF"
+        
+        # Check if already at daily order limit
+        summary = self.get_today_summary()
+        if summary["placed"] >= summary["cap"]:
+            return False, f"Daily order limit reached ({summary['placed']}/{summary['cap']})"
+        
+        # Check if loss cap would be hit  in LIVE mode
+        if self._mode == "LIVE" and summary["loss_cap_hit"]:
+            return False, f"Daily loss limit hit (₹{summary['realized_loss']:.2f}/₹{summary['loss_cap']:.2f})"
+        
+        # Validate signal
+        if not signal:
+            return False, "Signal is None"
+        
+        if not hasattr(signal, 'index_name'):
+            return False, "Signal missing index_name"
+        
+        if not hasattr(signal, 'direction'):
+            return False, "Signal missing direction"
+        
+        if signal.direction not in ('CE', 'PE', 'CALL', 'PUT'):
+            return False, f"Invalid direction: {signal.direction}"
+        
+        if not hasattr(signal, 'entry_reference') or signal.entry_reference <= 0:
+            return False, "Invalid entry price"
+        
+        if not hasattr(signal, 'stop_loss_reference') or signal.stop_loss_reference <= 0:
+            return False, "Invalid stop loss"
+        
+        # Validate expiry if provided
+        if expiry:
+            try:
+                from datetime import datetime as dt
+                dt.strptime(expiry, "%d-%m-%Y")
+            except ValueError:
+                return False, f"Invalid expiry format: {expiry} (expected DD-MM-YYYY)"
+        
+        return True, "OK"
+
     # ─── Internal helpers ────────────────────────────────────────
 
     def _maybe_reset_daily(self):
