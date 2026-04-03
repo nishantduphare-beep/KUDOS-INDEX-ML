@@ -557,7 +557,7 @@ class FyersAdapter(CombinedBrokerAdapter):
                     lp_val = float(v.get("lp", 0) or 0)
                     
                     # DIAGNOSTIC: Log available fields when OI is 0
-                    if oi_val == 0 and config.LOG_LEVEL == "DEBUG":
+                    if oi_val == 0 and logger.isEnabledFor(logging.DEBUG):
                         logger.debug(f"Futures OI is 0 for [{idx}]. Available fields in 'v': {list(v.keys())}")
                     
                     result[idx] = {"oi": oi_val, "lp": lp_val}

@@ -654,6 +654,7 @@ class DataManager:
                 for s in chain_data.get('strikes', []):
                     strikes.append(OptionStrike(
                         strike=s.get('strike', 0),
+                        expiry=s.get('expiry', ''),
                         call_ltp=s.get('call_ltp', 0),
                         call_iv=s.get('call_iv', 0),
                         call_oi=s.get('call_oi', 0),
