@@ -139,7 +139,9 @@ class OptionsFlowTab(QWidget):
             if expiries:
                 self._expiries_list = expiries
                 for exp in expiries:
-                    label = f"{exp['date']} ({exp['dte']}d)"
+                    # Format: "12-Apr-2026 (2d) [Weekly/Monthly]"
+                    exp_type = exp.get('type', 'Weekly')
+                    label = f"{exp['date']} ({exp['dte']}d) [{exp_type}]"
                     self._expiry_combo.addItem(label)
                 # Default to first (nearest) expiry
                 self._current_expiry_ts = expiries[0].get("unix_ts", 0)

@@ -15,6 +15,7 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Callable
 from datetime import datetime as _dt_type  # alias to avoid shadowing
+from dateutil.relativedelta import relativedelta
 
 import pandas as pd
 import numpy as np
@@ -536,7 +537,7 @@ class DataManager:
     
     def get_available_expiries(self, index_name: str) -> List[dict]:
         """Get all available expiry dates for an index from broker.
-        Returns: list of {"date": "DD-MMM-YYYY", "unix_ts": int, "dte": int}
+        Returns: list of {"date": "DD-MMM-YYYY", "unix_ts": int, "dte": int, "type": "Weekly/Monthly", "weekday": "Monday"}
         """
         try:
             if not hasattr(self._adapter, "get_expiry_dates"):
@@ -565,10 +566,16 @@ class DataManager:
                     if exp_date:
                         dte = (exp_date - today).days
                         unix_ts = int(dt_parse.combine(exp_date, dt_parse.min.time()).timestamp())
+                        
+                        # Determine expiry type (Weekly vs Monthly)
+                        expiry_type = self._get_expiry_type(index_name, exp_date)
+                        
                         result.append({
                             "date": exp_date.strftime("%d-%b-%Y"),
                             "unix_ts": unix_ts,
-                            "dte": dte
+                            "dte": dte,
+                            "type": expiry_type,
+                            "weekday": exp_date.strftime("%A")  # Monday, Tuesday, etc.
                         })
                 except Exception:
                     continue
@@ -579,6 +586,42 @@ class DataManager:
         except Exception as e:
             logger.debug(f"Error getting available expiries for {index_name}: {e}")
             return []
+    
+    def _get_expiry_type(self, index_name: str, exp_date) -> str:
+        """Determine if an expiry date is Weekly or Monthly based on index pattern."""
+        # Last day of the month (for monthly expirations)
+        end_of_month = exp_date + relativedelta(months=1)
+        end_of_month = end_of_month.replace(day=1) - relativedelta(days=1)
+        
+        # Check index-specific expiry patterns
+        if index_name in ["BANKNIFTY"]:
+            # BANKNIFTY: Monthly (last Wednesday) + Weekly (other Wednesdays)
+            if exp_date.weekday() == 2:  # Wednesday
+                if exp_date == end_of_month or (exp_date.month != (exp_date + relativedelta(days=7)).month):
+                    return "Monthly"  # Last/only Wednesday of month
+                else:
+                    return "Weekly"
+        elif index_name in ["NIFTY", "SENSEX"]:
+            # NIFTY/SENSEX: Weekly (Thursday) expirations
+            if exp_date.weekday() == 3:  # Thursday
+                # Check if it's the last Thursday of month (monthly expiry)
+                next_week = exp_date + relativedelta(days=7)
+                if next_week.month != exp_date.month:
+                    return "Monthly"  # Last Thursday = also monthly
+                else:
+                    return "Weekly"
+        elif index_name in ["MIDCPNIFTY"]:
+            # MIDCPNIFTY: Monthly (last Tuesday) + Weekly (other Tuesdays) 
+            if exp_date.weekday() == 1:  # Tuesday
+                if exp_date == end_of_month or (exp_date.month != (exp_date + relativedelta(days=7)).month):
+                    return "Monthly"  # Last/only Tuesday of month
+                else:
+                    return "Weekly"
+        
+        # Default fallback
+        if exp_date == end_of_month:
+            return "Monthly"
+        return "Weekly"
     
     def get_option_chain_from_db(self, index_name: str) -> Optional[OptionChain]:
         """Load most recent option chain snapshot from database (for non-trading hours)."""
