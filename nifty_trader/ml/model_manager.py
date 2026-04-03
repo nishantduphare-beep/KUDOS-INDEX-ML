@@ -752,32 +752,28 @@ class ModelManager:
                     f"({self._model_version.samples_used} samples, "
                     f"{self._model_version.model_type})"
                 )
-                # Validate schema hash against current FEATURE_COLUMNS
-                if self._model_version.feature_schema_hash:
-                    import hashlib
-                    _current_hash = hashlib.sha256(
-                        "|".join(sorted(FEATURE_COLUMNS)).encode()
-                    ).hexdigest()[:12]
-                    if _current_hash != self._model_version.feature_schema_hash:
-                        logger.warning(
-                            f"Feature schema hash mismatch: model has "
-                            f"{self._model_version.feature_schema_hash!r}, "
-                            f"current FEATURE_COLUMNS hash={_current_hash!r}. "
-                            f"Model was trained with a different feature set — retrain recommended."
-                        )
                 # Validate that saved feature columns match current FEATURE_COLUMNS.
                 # A mismatch means the model was trained with a different engine set
                 # and predictions will be silently wrong.
                 saved_cols   = set(self._model_version.feature_cols)
                 current_cols = set(FEATURE_COLUMNS)
-                missing  = current_cols - saved_cols   # new features model doesn't know
+                missing  = current_cols - saved_cols   # new features not yet in DB
                 extra    = saved_cols - current_cols   # old features no longer generated
-                if missing or extra:
+                if extra:
+                    # Dangerous: model uses features we no longer generate — predictions broken
                     logger.warning(
-                        f"Feature column mismatch detected in model v{self._model_version.version}! "
-                        f"Missing from model: {sorted(missing) or 'none'}. "
-                        f"Extra in model (no longer generated): {sorted(extra) or 'none'}. "
-                        f"Predictions may be inaccurate — consider retraining."
+                        f"Feature column mismatch in model v{self._model_version.version}! "
+                        f"Extra in model (no longer generated): {sorted(extra)}. "
+                        f"Retrain required."
+                    )
+                elif missing:
+                    # New features added to FEATURE_COLUMNS but not yet in DB records.
+                    # Model will use 0 for them — fine until options_feature_engine
+                    # writes them during live market and a retrain occurs.
+                    logger.info(
+                        f"Model v{self._model_version.version}: {len(missing)} new features "
+                        f"not yet in DB ({', '.join(sorted(missing)[:3])}{'...' if len(missing) > 3 else ''}). "
+                        f"Model will auto-retrain once options data is collected."
                     )
                 else:
                     logger.info(f"Feature columns validated OK ({len(current_cols)} features match)")
