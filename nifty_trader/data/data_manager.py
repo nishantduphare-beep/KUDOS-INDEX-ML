@@ -645,6 +645,9 @@ class DataManager:
                 row = rows[0]
                 # Parse chain_data JSON
                 chain_data = json.loads(row.chain_data) if isinstance(row.chain_data, str) else row.chain_data or {}
+                # Backward compat: old records stored chain_data as a flat list of strikes
+                if isinstance(chain_data, list):
+                    chain_data = {"strikes": chain_data, "next_expiry_unix": 0}
 
                 # Reconstruct OptionChain from stored data
                 strikes = []
@@ -974,7 +977,8 @@ class DataManager:
                 "max_pain":      float(chain.max_pain),
                 "avg_atm_iv":    avg_atm_iv,
                 "iv_rank":       iv_rank,
-                "chain_data":    [s.to_dict() for s in chain.strikes],
+                "chain_data":    {"strikes": [s.to_dict() for s in chain.strikes],
+                                  "next_expiry_unix": chain.next_expiry_unix},
             }
             self._db.save_option_snapshot(snap)
         except Exception as e:
