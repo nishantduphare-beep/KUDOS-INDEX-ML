@@ -4,6 +4,7 @@ Tab 3 — Options Flow
 Full option chain display with PCR, OI heatmap, Max Pain.
 """
 
+import logging
 from datetime import datetime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -14,6 +15,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QBrush
 
 import config
+
+logger = logging.getLogger(__name__)
 
 
 def _item(text, color="#c9d1d9", bg=None, bold=False, center=True):
@@ -37,7 +40,10 @@ class OptionsFlowTab(QWidget):
         super().__init__()
         self._dm  = data_manager
         self._current_index = config.INDICES[0]
+        self._current_expiry_ts = 0  # 0 = nearest/primary
+        self._expiries_list = []    # Available expiries from broker
         self._build_ui()
+        self._load_expiries()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -51,10 +57,18 @@ class OptionsFlowTab(QWidget):
         self._idx_combo = QComboBox()
         self._idx_combo.addItems(config.INDICES)
         self._idx_combo.currentTextChanged.connect(self._on_index_changed)
+        
+        # Expiry selector
+        self._expiry_combo = QComboBox()
+        self._expiry_combo.currentIndexChanged.connect(self._on_expiry_changed)
+        
         ctrl.addWidget(title)
         ctrl.addStretch()
         ctrl.addWidget(QLabel("Index:"))
         ctrl.addWidget(self._idx_combo)
+        ctrl.addSpacing(20)
+        ctrl.addWidget(QLabel("Expiry:"))
+        ctrl.addWidget(self._expiry_combo)
         layout.addLayout(ctrl)
 
         # Metrics bar
@@ -105,11 +119,44 @@ class OptionsFlowTab(QWidget):
 
     def _on_index_changed(self, text):
         self._current_index = text
+        self._load_expiries()
         self.refresh()
+    
+    def _on_expiry_changed(self, index):
+        if index >= 0 and index < len(self._expiries_list):
+            self._current_expiry_ts = self._expiries_list[index].get("unix_ts", 0)
+        self.refresh()
+    
+    def _load_expiries(self):
+        """Fetch available expiries from broker and populate combo box."""
+        idx = self._current_index
+        self._expiry_combo.blockSignals(True)
+        self._expiry_combo.clear()
+        self._expiries_list = []
+        
+        try:
+            expiries = self._dm.get_available_expiries(idx)
+            if expiries:
+                self._expiries_list = expiries
+                for exp in expiries:
+                    label = f"{exp['date']} ({exp['dte']}d)"
+                    self._expiry_combo.addItem(label)
+                # Default to first (nearest) expiry
+                self._current_expiry_ts = expiries[0].get("unix_ts", 0)
+            else:
+                self._expiry_combo.addItem("Primary")
+                self._current_expiry_ts = 0
+        except Exception as e:
+            logger.debug(f"Error loading expiries: {e}")
+            self._expiry_combo.addItem("Primary")
+            self._current_expiry_ts = 0
+        
+        self._expiry_combo.blockSignals(False)
 
     def refresh(self):
         idx   = self._current_index
-        chain = self._dm.get_option_chain(idx)
+        # Fetch option chain for selected expiry (0 = primary/nearest)
+        chain = self._dm.get_option_chain(idx, expiry_ts=self._current_expiry_ts)
         spot  = self._dm.get_spot(idx)
 
         if not chain:

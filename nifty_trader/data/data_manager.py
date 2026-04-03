@@ -508,7 +508,21 @@ class DataManager:
     def get_spot(self, index_name: str) -> float:
         return self._states[index_name].spot_price
 
-    def get_option_chain(self, index_name: str) -> Optional[OptionChain]:
+    def get_option_chain(self, index_name: str, expiry_ts: int = 0) -> Optional[OptionChain]:
+        """Get option chain for current or specific expiry.
+        expiry_ts: Unix timestamp of specific expiry (0 = nearest/primary)
+        """
+        if expiry_ts > 0:
+            # Fetch specific expiry from broker
+            try:
+                if hasattr(self._adapter, "get_option_chain"):
+                    chain = self._adapter.get_option_chain(index_name, expiry_ts=expiry_ts)
+                    return chain
+            except Exception as e:
+                logger.debug(f"Error fetching option chain for specific expiry [{index_name}]: {e}")
+                return None
+        
+        # Default: get primary/nearest expiry
         chain = self._states[index_name].get_option_chain()
         
         # Fallback to recent DB snapshot if no live data (non-trading hours/holiday)
@@ -519,6 +533,52 @@ class DataManager:
                 pass
         
         return chain
+    
+    def get_available_expiries(self, index_name: str) -> List[dict]:
+        """Get all available expiry dates for an index from broker.
+        Returns: list of {"date": "DD-MMM-YYYY", "unix_ts": int, "dte": int}
+        """
+        try:
+            if not hasattr(self._adapter, "get_expiry_dates"):
+                return []
+            
+            expiry_dates = self._adapter.get_expiry_dates(index_name)
+            if not expiry_dates:
+                return []
+            
+            from datetime import datetime as dt_parse
+            from datetime import timedelta
+            today = dt_parse.today().date()
+            
+            result = []
+            for exp_str in expiry_dates:
+                try:
+                    # Try parsing different date formats
+                    exp_date = None
+                    for fmt in ["%d-%b-%Y", "%d%b%Y", "%Y-%m-%d", "%d-%m-%Y"]:
+                        try:
+                            exp_date = dt_parse.strptime(exp_str, fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                    
+                    if exp_date:
+                        dte = (exp_date - today).days
+                        unix_ts = int(dt_parse.combine(exp_date, dt_parse.min.time()).timestamp())
+                        result.append({
+                            "date": exp_date.strftime("%d-%b-%Y"),
+                            "unix_ts": unix_ts,
+                            "dte": dte
+                        })
+                except Exception:
+                    continue
+            
+            # Sort by DTE (nearest first)
+            result.sort(key=lambda x: x["dte"])
+            return result
+        except Exception as e:
+            logger.debug(f"Error getting available expiries for {index_name}: {e}")
+            return []
     
     def get_option_chain_from_db(self, index_name: str) -> Optional[OptionChain]:
         """Load most recent option chain snapshot from database (for non-trading hours)."""
