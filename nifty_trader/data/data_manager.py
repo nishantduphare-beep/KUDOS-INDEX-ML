@@ -24,6 +24,7 @@ from data.structures import Candle, OptionChain
 from data.base_api import CombinedBrokerAdapter
 from data.adapters import get_adapter
 from database.manager import get_db
+from database import models as db_models
 
 logger = logging.getLogger(__name__)
 
@@ -508,7 +509,73 @@ class DataManager:
         return self._states[index_name].spot_price
 
     def get_option_chain(self, index_name: str) -> Optional[OptionChain]:
-        return self._states[index_name].get_option_chain()
+        chain = self._states[index_name].get_option_chain()
+        
+        # Fallback to recent DB snapshot if no live data (non-trading hours/holiday)
+        if not chain:
+            try:
+                chain = self.get_option_chain_from_db(index_name)
+            except:
+                pass
+        
+        return chain
+    
+    def get_option_chain_from_db(self, index_name: str) -> Optional[OptionChain]:
+        """Load most recent option chain snapshot from database (for non-trading hours)."""
+        try:
+            rows = self._db.session.query(
+                db_models.OptionChainSnapshot
+            ).filter(
+                db_models.OptionChainSnapshot.index_name == index_name
+            ).order_by(
+                db_models.OptionChainSnapshot.timestamp.desc()
+            ).limit(1).all()
+            
+            if rows:
+                row = rows[0]
+                # Parse chain_data JSON
+                import json
+                chain_data = json.loads(row.chain_data) if isinstance(row.chain_data, str) else row.chain_data or {}
+                
+                # Reconstruct OptionChain from stored data
+                from data.structures import OptionStrike
+                
+                strikes = []
+                for s in chain_data.get('strikes', []):
+                    strikes.append(OptionStrike(
+                        strike=s.get('strike', 0),
+                        call_ltp=s.get('call_ltp', 0),
+                        call_iv=s.get('call_iv', 0),
+                        call_oi=s.get('call_oi', 0),
+                        call_volume=s.get('call_volume', 0),
+                        call_oi_change=s.get('call_oi_change', 0),
+                        put_ltp=s.get('put_ltp', 0),
+                        put_iv=s.get('put_iv', 0),
+                        put_oi=s.get('put_oi', 0),
+                        put_volume=s.get('put_volume', 0),
+                        put_oi_change=s.get('put_oi_change', 0),
+                    ))
+                
+                chain = OptionChain(
+                    strikes=strikes,
+                    atm_strike=chain_data.get('atm_strike', 0),
+                    pcr=chain_data.get('pcr', 0),
+                    pcr_volume=chain_data.get('pcr_volume', 0),
+                    max_pain=chain_data.get('max_pain', 0),
+                    total_call_oi=chain_data.get('total_call_oi', 0),
+                    total_put_oi=chain_data.get('total_put_oi', 0),
+                    expiry=chain_data.get('expiry', ''),
+                    next_expiry_unix=chain_data.get('next_expiry_unix', 0),
+                )
+                
+                logger.debug(f"Loaded option chain for {index_name} from DB (timestamp: {row.timestamp})")
+                return chain
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Error loading option chain from DB: {e}")
+            return None
 
     def get_prev_close(self, index_name: str) -> float:
         return self._states[index_name].prev_day_close
