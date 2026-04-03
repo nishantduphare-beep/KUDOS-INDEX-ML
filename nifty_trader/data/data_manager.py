@@ -626,23 +626,27 @@ class DataManager:
     def get_option_chain_from_db(self, index_name: str) -> Optional[OptionChain]:
         """Load most recent option chain snapshot from database (for non-trading hours)."""
         try:
-            rows = self._db.session.query(
-                db_models.OptionChainSnapshot
-            ).filter(
-                db_models.OptionChainSnapshot.index_name == index_name
-            ).order_by(
-                db_models.OptionChainSnapshot.timestamp.desc()
-            ).limit(1).all()
-            
-            if rows:
+            import json
+            from data.structures import OptionStrike
+
+            with self._db.get_session() as session:
+                rows = session.query(
+                    db_models.OptionChainSnapshot
+                ).filter(
+                    db_models.OptionChainSnapshot.index_name == index_name
+                ).order_by(
+                    db_models.OptionChainSnapshot.timestamp.desc()
+                ).limit(1).all()
+
+                if not rows:
+                    logger.debug(f"No option chain found in DB for {index_name}")
+                    return None
+
                 row = rows[0]
                 # Parse chain_data JSON
-                import json
                 chain_data = json.loads(row.chain_data) if isinstance(row.chain_data, str) else row.chain_data or {}
-                
+
                 # Reconstruct OptionChain from stored data
-                from data.structures import OptionStrike
-                
                 strikes = []
                 for s in chain_data.get('strikes', []):
                     strikes.append(OptionStrike(
@@ -658,22 +662,18 @@ class DataManager:
                         put_volume=s.get('put_volume', 0),
                         put_oi_change=s.get('put_oi_change', 0),
                     ))
-                
-                # Create OptionChain with required fields from snapshot row
+
                 chain = OptionChain(
                     index_name=row.index_name,
-                    spot_price=float(row.spot_price),
-                    expiry=row.expiry_date,
+                    spot_price=float(row.spot_price or 0),
+                    expiry=row.expiry_date or '',
                     strikes=strikes,
                     next_expiry_unix=chain_data.get('next_expiry_unix', 0),
                 )
-                
+
                 logger.debug(f"Loaded option chain for {index_name} from DB (timestamp: {row.timestamp}, spot: {row.spot_price}, expires: {row.expiry_date})")
                 return chain
-            
-            logger.debug(f"No option chain found in DB for {index_name}")
-            return None
-            
+
         except Exception as e:
             logger.debug(f"Error loading option chain from DB for {index_name}: {e}")
             return None

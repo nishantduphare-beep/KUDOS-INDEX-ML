@@ -168,7 +168,7 @@ class OptionsFlowTab(QWidget):
             # Show empty state
             self._chain_table.setRowCount(0)
             self._expiry_lbl.setText("-- NO DATA --")
-            self._spot_lbl.setText(f"₹{spot:,.2f}" if spot > 0 else "--")
+            self._spot_lbl.setText(f"₹{spot:,.2f}" if spot and spot > 0 else "--")
             for lbl in [self._pcr_lbl, self._pcr_vol_lbl, self._maxpain_lbl, 
                         self._total_ce_lbl, self._total_pe_lbl, self._oi_sig_lbl,
                         self._atm_iv_lbl, self._iv_skew_lbl]:
@@ -218,6 +218,9 @@ class OptionsFlowTab(QWidget):
         max_call_oi = max((s.call_oi for s in chain.strikes), default=1)
         max_put_oi  = max((s.put_oi  for s in chain.strikes), default=1)
 
+        def _fmt_oi(v): return f"{v/1000:.1f}K" if v >= 1000 else str(v)
+        def _fmt_ch(v): return f"{v/1000:+.1f}K" if abs(v) >= 1000 else f"{int(v):+d}"
+
         self._chain_table.setRowCount(len(strikes))
         for row_idx, s in enumerate(strikes):
             is_atm    = s.strike == atm
@@ -237,9 +240,6 @@ class OptionsFlowTab(QWidget):
             delta_p_color = "#3fb950" if s.put_oi_change  > 0 else "#f85149"
             call_ltp_color = "#8b949e" if is_itm_p else "#c9d1d9"
             put_ltp_color  = "#8b949e" if is_itm_c else "#c9d1d9"
-
-            def _fmt_oi(v): return f"{v/1000:.1f}K" if v >= 1000 else str(v)
-            def _fmt_ch(v): return f"{v/1000:+.1f}K" if abs(v) >= 1000 else f"{int(v):+d}"
 
             self._chain_table.setItem(row_idx, 0, _item(_fmt_oi(s.call_oi), "#c9d1d9", bg=call_bg))
             self._chain_table.setItem(row_idx, 1, _item(_fmt_ch(s.call_oi_change), delta_c_color))
