@@ -44,6 +44,7 @@ class OptionsFlowTab(QWidget):
         self._expiries_list = []    # Available expiries from broker
         self._build_ui()
         self._load_expiries()
+        self.refresh()  # Load initial data
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -138,6 +139,7 @@ class OptionsFlowTab(QWidget):
             expiries = self._dm.get_available_expiries(idx)
             if expiries:
                 self._expiries_list = expiries
+                logger.info(f"Loaded {len(expiries)} expiries for {idx}")
                 for exp in expiries:
                     # Format: "12-Apr-2026 (2d) [Weekly/Monthly]"
                     exp_type = exp.get('type', 'Weekly')
@@ -162,6 +164,15 @@ class OptionsFlowTab(QWidget):
         spot  = self._dm.get_spot(idx)
 
         if not chain:
+            logger.warning(f"No option chain data available for {idx} (expiry_ts={self._current_expiry_ts})")
+            # Show empty state
+            self._chain_table.setRowCount(0)
+            self._expiry_lbl.setText("-- NO DATA --")
+            self._spot_lbl.setText(f"₹{spot:,.2f}" if spot > 0 else "--")
+            for lbl in [self._pcr_lbl, self._pcr_vol_lbl, self._maxpain_lbl, 
+                        self._total_ce_lbl, self._total_pe_lbl, self._oi_sig_lbl,
+                        self._atm_iv_lbl, self._iv_skew_lbl]:
+                lbl.setText("--")
             return
 
         # Update metrics

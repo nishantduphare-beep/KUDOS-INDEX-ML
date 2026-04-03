@@ -659,25 +659,23 @@ class DataManager:
                         put_oi_change=s.get('put_oi_change', 0),
                     ))
                 
+                # Create OptionChain with required fields from snapshot row
                 chain = OptionChain(
+                    index_name=row.index_name,
+                    spot_price=float(row.spot_price),
+                    expiry=row.expiry_date,
                     strikes=strikes,
-                    atm_strike=chain_data.get('atm_strike', 0),
-                    pcr=chain_data.get('pcr', 0),
-                    pcr_volume=chain_data.get('pcr_volume', 0),
-                    max_pain=chain_data.get('max_pain', 0),
-                    total_call_oi=chain_data.get('total_call_oi', 0),
-                    total_put_oi=chain_data.get('total_put_oi', 0),
-                    expiry=chain_data.get('expiry', ''),
                     next_expiry_unix=chain_data.get('next_expiry_unix', 0),
                 )
                 
-                logger.debug(f"Loaded option chain for {index_name} from DB (timestamp: {row.timestamp})")
+                logger.debug(f"Loaded option chain for {index_name} from DB (timestamp: {row.timestamp}, spot: {row.spot_price}, expires: {row.expiry_date})")
                 return chain
             
+            logger.debug(f"No option chain found in DB for {index_name}")
             return None
             
         except Exception as e:
-            logger.debug(f"Error loading option chain from DB: {e}")
+            logger.debug(f"Error loading option chain from DB for {index_name}: {e}")
             return None
 
     def get_prev_close(self, index_name: str) -> float:
